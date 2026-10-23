@@ -1,6 +1,7 @@
 //! `partizan`: OpenWrt client daemon wiring `socks5` into `client-core`.
 
 mod admin;
+mod bench;
 mod logger;
 
 use std::net::SocketAddr;
@@ -17,6 +18,7 @@ const USAGE: &str = "\
 usage: partizan run (--uri URI | --uri-file PATH) [--socks ADDR] [--log-level LEVEL]
                     [--honest-connect] [--admin-sock PATH]
        partizan check (--uri URI | --uri-file PATH)
+       partizan bench (--uri URI | --uri-file PATH) [--seconds N] [--streams N]
        partizan status [--admin-sock PATH]
        partizan rebind [--admin-sock PATH]
        partizan version";
@@ -37,6 +39,11 @@ enum Command {
     Check {
         uri: ConnectionUri,
     },
+    Bench {
+        uri: ConnectionUri,
+        seconds: u64,
+        streams: usize,
+    },
     Version,
 }
 
@@ -54,6 +61,7 @@ fn parse_args() -> Result<Command, String> {
     let (mut uri, mut socks, mut level, mut honest) =
         (None, DEFAULT_SOCKS.to_owned(), LevelFilter::Info, false);
     let mut admin = PathBuf::from(admin::DEFAULT_SOCKET);
+    let (mut seconds, mut streams) = (10u64, 4usize);
     while let Some(arg) = parser.next().map_err(fail)? {
         match arg {
             // A URI on the command line is visible in `ps`; prefer --uri-file.
@@ -76,6 +84,12 @@ fn parse_args() -> Result<Command, String> {
             }
             Long("honest-connect") => honest = true,
             Long("admin-sock") => admin = parser.value().map_err(fail)?.into(),
+            Long("seconds") => {
+                seconds = parser.value().map_err(fail)?.parse().map_err(fail)?;
+            }
+            Long("streams") => {
+                streams = parser.value().map_err(fail)?.parse().map_err(fail)?;
+            }
             _ => return Err(format!("{}\n{USAGE}", fail(arg.unexpected()))),
         }
     }
@@ -107,6 +121,11 @@ fn parse_args() -> Result<Command, String> {
             admin,
         }),
         "check" => Ok(Command::Check { uri }),
+        "bench" => Ok(Command::Bench {
+            uri,
+            seconds: seconds.max(1),
+            streams: streams.clamp(1, 64),
+        }),
         other => Err(format!("unknown command {other:?}\n{USAGE}")),
     }
 }
@@ -143,6 +162,27 @@ fn main() -> ExitCode {
                 proto::auth::PROTOCOL_VERSION
             );
             ExitCode::SUCCESS
+        }
+        Command::Bench {
+            uri,
+            seconds,
+            streams,
+        } => {
+            logger::init(LevelFilter::Warn);
+            let rt = match runtime() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("runtime: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(bench::run(&engine(uri), seconds, streams)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("bench failed: {e} (is [bench] enabled on the server?)");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Command::Check { uri } => {
             logger::init(LevelFilter::Warn);

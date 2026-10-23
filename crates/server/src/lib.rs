@@ -1,6 +1,7 @@
 //! partizan server: accepts device sessions over QUIC, authenticates them against the
 //! registry and opens their TCP connections from the server's address.
 
+pub mod bench;
 pub mod config;
 pub mod dial;
 pub mod egress;
@@ -89,6 +90,8 @@ pub struct State {
     pub metrics: Metrics,
     udp: UdpLimits,
     udp_per_device: Mutex<HashMap<auth::DeviceId, Arc<AtomicUsize>>>,
+    /// Benchmark UDP echo when `[bench]` is enabled.
+    pub(crate) bench_udp: Option<SocketAddr>,
 }
 
 impl State {
@@ -164,6 +167,11 @@ impl Server {
                 dns_idle: config.limits.udp_dns_idle_timeout,
             },
             udp_per_device: Mutex::new(HashMap::new()),
+            bench_udp: if config.bench.enabled {
+                Some(bench::spawn_udp_echo().await?)
+            } else {
+                None
+            },
         };
         Ok(Self {
             endpoint,

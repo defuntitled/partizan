@@ -156,6 +156,12 @@ impl UdpNat {
 
     /// Resolves and checks a destination; `None` if unresolvable or not allowed.
     async fn destination(&self, target: &TargetAddr) -> Option<SocketAddr> {
+        // The benchmark echo lives on loopback, which the egress policy rightly refuses.
+        if let Some(echo) = self.state.bench_udp
+            && crate::bench::is_bench(target)
+        {
+            return (target.port == proto::bench::ECHO).then_some(echo);
+        }
         let ips = resolve(&target.host, &self.state.resolver).await.ok()?;
         let ip = ips.into_iter().find(|ip| self.state.egress.allows(*ip))?;
         Some(SocketAddr::new(ip, target.port))

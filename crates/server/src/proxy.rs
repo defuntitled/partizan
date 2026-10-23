@@ -48,6 +48,10 @@ async fn serve(mut send: SendHalf, mut recv: RecvHalf, state: &State) {
             return;
         }
     };
+    if state.bench_udp.is_some() && crate::bench::is_bench(&connect.addr) {
+        crate::bench::serve(connect.addr.port, early, send, recv).await;
+        return;
+    }
     let tcp = match dial(&connect.addr, &state.resolver, &state.egress).await {
         Ok(tcp) => tcp,
         Err(e) => {

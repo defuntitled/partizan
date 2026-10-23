@@ -29,6 +29,17 @@ pub struct Config {
     /// `[resolver]`.
     #[serde(default)]
     pub resolver: ResolverSection,
+    /// `[bench]`.
+    #[serde(default)]
+    pub bench: BenchSection,
+}
+
+/// `[bench]`: endpoints for `partizan bench`; off by default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BenchSection {
+    /// Serve `partizan.bench` to authenticated devices.
+    pub enabled: bool,
 }
 
 /// `[server]`.

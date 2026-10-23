@@ -63,6 +63,7 @@ async fn start_server(token: [u8; 32]) -> PathBuf {
             timeout: Duration::from_millis(500),
             attempts: 1,
         },
+        bench: server::config::BenchSection { enabled: true },
     };
     let server = Server::bind(config).await.unwrap();
     let addr = server.local_addr().unwrap();
@@ -551,4 +552,30 @@ async fn c13_t4_status_returns_valid_json() {
     // Not running: a clear error and a failing exit status.
     let (ok, _) = status(temp_dir().join("nothing.sock")).await;
     assert!(!ok);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c15_bench_reports_throughput_and_latency() {
+    let uri = start_server(TOKEN).await;
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_partizan"))
+        .args(["bench", "--seconds", "1", "--streams", "2", "--uri-file"])
+        .arg(&uri)
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for line in [
+        "tcp echo rtt",
+        "udp echo rtt",
+        "download",
+        "upload",
+        "Mbit/s",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in\n{stdout}");
+    }
 }

@@ -10,6 +10,7 @@ name = "partizan"
 path = "src/main.rs"
 
 [dependencies]
+bytes.workspace = true
 client-core.workspace = true
 lexopt.workspace = true
 log.workspace = true

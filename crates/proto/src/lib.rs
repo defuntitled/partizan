@@ -10,6 +10,7 @@
 
 pub mod addr;
 pub mod auth;
+pub mod bench;
 pub mod connect;
 pub mod control;
 mod error;

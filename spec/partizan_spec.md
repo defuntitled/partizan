@@ -471,6 +471,7 @@ config client 'main'
 | `partizan check --uri …` | Пробное подключение по обоим транспортам с диагностикой |
 | `partizan rebind` | Перепривязать QUIC-сокет после смены WAN-адреса (вызывает hotplug-скрипт `ifup wan`) |
 | `partizan version` | Версия бинаря и протокола |
+| `partizan bench` | Пропускная способность (N потоков), RTT по stream и по датаграммам, CPU клиента — через тестовые эндпоинты сервера `partizan.bench` (`[bench] enabled = true`, по умолчанию выключены) |
 
 ### procd и упаковка
 

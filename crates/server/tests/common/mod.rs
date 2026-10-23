@@ -85,6 +85,7 @@ pub async fn start_with(
             timeout: Duration::from_millis(500),
             attempts: 1,
         },
+        bench: Default::default(),
     };
     let server = Server::bind(config).await.unwrap();
     let addr = server.local_addr().unwrap();

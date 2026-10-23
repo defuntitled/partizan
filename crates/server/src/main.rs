@@ -60,7 +60,9 @@ fn main() -> ExitCode {
 }
 
 fn run(path: PathBuf) -> ExitCode {
+    // Colours only on a terminal; journald and log files get plain text.
     tracing_subscriber::fmt()
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
