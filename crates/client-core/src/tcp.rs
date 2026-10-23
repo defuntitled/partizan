@@ -89,15 +89,30 @@ impl Engine {
     pub async fn handle_tcp(&self, request: TcpRequest) {
         let dst = request.dst.clone();
         match self.open_tcp(request.dst, false).await {
-            Ok((send, recv)) => relay(request.io, send, recv, true).await,
+            Ok((send, recv)) => self.relay(request.io, send, recv, true).await,
             Err(e) => log::debug!("connect to {dst:?} failed: {e}"),
         }
     }
 }
 
-/// Copies a local connection and a tunnel stream both ways with half-close. With
-/// `result_pending` the `ConnectResult` header is read off the stream first.
-pub async fn relay(
+impl Engine {
+    /// Copies a local connection and a tunnel stream both ways with half-close. With
+    /// `result_pending` the `ConnectResult` header is read off the stream first.
+    pub async fn relay(
+        &self,
+        io: Box<dyn AsyncReadWrite>,
+        send: SendHalf,
+        recv: RecvHalf,
+        result_pending: bool,
+    ) {
+        let counter = &self.inner.tcp_streams;
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        relay(io, send, recv, result_pending).await;
+        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn relay(
     io: Box<dyn AsyncReadWrite>,
     mut send: SendHalf,
     mut recv: RecvHalf,

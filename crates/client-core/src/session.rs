@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use proto::auth::{
@@ -55,6 +56,14 @@ pub struct Status {
     pub session: Option<SessionInfo>,
     /// Transport counters.
     pub stats: TransportStats,
+    /// Proxied TCP connections open now.
+    pub tcp_streams: usize,
+    /// UDP flows open now.
+    pub udp_flows: usize,
+    /// UDP datagrams dropped (oversize or full queues).
+    pub udp_drops: u64,
+    /// Sessions established after the first.
+    pub reconnects: u64,
 }
 
 /// An authenticated connection.
@@ -93,6 +102,8 @@ pub(crate) struct Inner {
     config: EngineConfig,
     pub(crate) session: Mutex<Option<Arc<Session>>>,
     pub(crate) udp: Arc<UdpRegistry>,
+    pub(crate) tcp_streams: AtomicUsize,
+    sessions_established: AtomicU64,
 }
 
 impl Engine {
@@ -103,6 +114,8 @@ impl Engine {
                 config,
                 session: Mutex::new(None),
                 udp: Arc::new(UdpRegistry::default()),
+                tcp_streams: AtomicUsize::new(0),
+                sessions_established: AtomicU64::new(0),
             }),
         }
     }
@@ -122,6 +135,9 @@ impl Engine {
         // UDP sessions of the old connection are gone on the server; the next datagram of every
         // flow carries its address again.
         self.inner.udp.reset_all();
+        self.inner
+            .sessions_established
+            .fetch_add(1, Ordering::Relaxed);
         *slot = Some(session.clone());
         Ok(session)
     }
@@ -129,19 +145,20 @@ impl Engine {
     /// Current state.
     pub async fn status(&self) -> Status {
         let slot = self.inner.session.lock().await;
-        match slot.as_ref().filter(|s| s.is_alive()) {
-            Some(s) => Status {
-                connected: true,
-                transport: Some("quic"),
-                session: Some(s.info),
-                stats: s.transport.stats(),
-            },
-            None => Status {
-                connected: false,
-                transport: None,
-                session: None,
-                stats: TransportStats::default(),
-            },
+        let live = slot.as_ref().filter(|s| s.is_alive());
+        Status {
+            connected: live.is_some(),
+            transport: live.map(|_| "quic"),
+            session: live.map(|s| s.info),
+            stats: live.map_or_else(TransportStats::default, |s| s.transport.stats()),
+            tcp_streams: self.inner.tcp_streams.load(Ordering::Relaxed),
+            udp_flows: self.inner.udp.len(),
+            udp_drops: self.inner.udp.drops.load(Ordering::Relaxed),
+            reconnects: self
+                .inner
+                .sessions_established
+                .load(Ordering::Relaxed)
+                .saturating_sub(1),
         }
     }
 }

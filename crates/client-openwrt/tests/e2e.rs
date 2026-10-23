@@ -88,6 +88,7 @@ async fn start_server(token: [u8; 32]) -> PathBuf {
 struct Client {
     child: Child,
     socks: SocketAddr,
+    admin: PathBuf,
 }
 
 impl Drop for Client {
@@ -99,10 +100,18 @@ impl Drop for Client {
 
 async fn start_client(uri: &PathBuf, extra: &[&str]) -> Client {
     // Port 0: the client picks a free port and logs it, so parallel tests never collide.
+    let admin = temp_dir().join("admin.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_partizan"))
         .args(["run", "--uri-file"])
         .arg(uri)
-        .args(["--socks", "127.0.0.1:0", "--log-level", "info"])
+        .args([
+            "--socks",
+            "127.0.0.1:0",
+            "--log-level",
+            "info",
+            "--admin-sock",
+        ])
+        .arg(&admin)
         .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -111,6 +120,7 @@ async fn start_client(uri: &PathBuf, extra: &[&str]) -> Client {
     let mut client = Client {
         child,
         socks: "0.0.0.0:0".parse().unwrap(),
+        admin,
     };
     let stderr = client.child.stderr.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -490,4 +500,55 @@ async fn c11_t4_fragments_are_dropped() {
     let (_, query) = seen.recv().await.unwrap();
     assert_eq!(&query[..2], &6u16.to_be_bytes());
     assert!(seen.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c13_t4_status_returns_valid_json() {
+    let uri = start_server(TOKEN).await;
+    let client = start_client(&uri, &[]).await;
+    let echo = echo_server("127.0.0.1:0").await.unwrap();
+    let (s, rep) = socks_connect(client.socks, &v4(Ipv4Addr::LOCALHOST), echo.port()).await;
+    assert_eq!(rep, 0);
+    let status = |admin: PathBuf| async move {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_partizan"))
+            .args(["status", "--admin-sock"])
+            .arg(admin)
+            .output()
+            .await
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8(output.stdout).unwrap(),
+        )
+    };
+    // The stream is counted right after the SOCKS reply; poll briefly instead of racing it.
+    let (mut json, mut value) = (String::new(), serde_json::Value::Null);
+    for _ in 0..40 {
+        let (ok, out) = status(client.admin.clone()).await;
+        assert!(ok);
+        value = serde_json::from_str(&out).expect("valid JSON");
+        json = out;
+        if value["tcp_streams"] == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(value["state"], "connected");
+    assert_eq!(value["transport"], "quic");
+    assert_eq!(value["tcp_streams"], 1, "{json}");
+    assert!(value["session"]["sid"].is_string());
+    for key in [
+        "rtt_ms",
+        "bytes_sent",
+        "bytes_received",
+        "udp_flows",
+        "udp_drops",
+        "reconnects",
+    ] {
+        assert!(value[key].is_number(), "{key} in {json}");
+    }
+    drop(s);
+    // Not running: a clear error and a failing exit status.
+    let (ok, _) = status(temp_dir().join("nothing.sock")).await;
+    assert!(!ok);
 }

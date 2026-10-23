@@ -7,7 +7,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use client_core::{ConnectError, Engine, relay};
+use client_core::{ConnectError, Engine};
 use proto::{Host, TargetAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -116,7 +116,9 @@ async fn handle(mut stream: TcpStream, engine: &Engine, options: &Options) -> Re
     {
         Ok((send, recv)) => {
             write_reply(&mut stream, reply::SUCCEEDED).await?;
-            relay(Box::new(stream), send, recv, !options.honest_connect).await;
+            engine
+                .relay(Box::new(stream), send, recv, !options.honest_connect)
+                .await;
         }
         Err(e) => {
             log::debug!("CONNECT {:?}: {e}", request.target);

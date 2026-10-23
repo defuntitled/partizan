@@ -1,5 +1,6 @@
 //! `partizan`: OpenWrt client daemon wiring `socks5` into `client-core`.
 
+mod admin;
 mod logger;
 
 use std::net::SocketAddr;
@@ -13,8 +14,10 @@ use proto::auth::{ClientInfo, ConnectionUri};
 use transport::QuicConfig;
 
 const USAGE: &str = "\
-usage: partizan run (--uri URI | --uri-file PATH) [--socks ADDR] [--log-level LEVEL] [--honest-connect]
+usage: partizan run (--uri URI | --uri-file PATH) [--socks ADDR] [--log-level LEVEL]
+                    [--honest-connect] [--admin-sock PATH]
        partizan check (--uri URI | --uri-file PATH)
+       partizan status [--admin-sock PATH]
        partizan version";
 const DEFAULT_SOCKS: &str = "127.0.0.1:1080";
 
@@ -24,6 +27,10 @@ enum Command {
         socks: SocketAddr,
         level: LevelFilter,
         honest: bool,
+        admin: PathBuf,
+    },
+    Status {
+        admin: PathBuf,
     },
     Check {
         uri: ConnectionUri,
@@ -44,6 +51,7 @@ fn parse_args() -> Result<Command, String> {
     }
     let (mut uri, mut socks, mut level, mut honest) =
         (None, DEFAULT_SOCKS.to_owned(), LevelFilter::Info, false);
+    let mut admin = PathBuf::from(admin::DEFAULT_SOCKET);
     while let Some(arg) = parser.next().map_err(fail)? {
         match arg {
             // A URI on the command line is visible in `ps`; prefer --uri-file.
@@ -65,8 +73,12 @@ fn parse_args() -> Result<Command, String> {
                     .map_err(|_| "bad --log-level")?;
             }
             Long("honest-connect") => honest = true,
+            Long("admin-sock") => admin = parser.value().map_err(fail)?.into(),
             _ => return Err(format!("{}\n{USAGE}", fail(arg.unexpected()))),
         }
+    }
+    if command == "status" {
+        return Ok(Command::Status { admin });
     }
     let uri = ConnectionUri::parse(&uri.ok_or("--uri or --uri-file is required")?)
         .map_err(|e| e.to_string())?;
@@ -78,6 +90,7 @@ fn parse_args() -> Result<Command, String> {
                 .map_err(|_| format!("bad --socks address {socks:?}"))?,
             level,
             honest,
+            admin,
         }),
         "check" => Ok(Command::Check { uri }),
         other => Err(format!("unknown command {other:?}\n{USAGE}")),
@@ -127,15 +140,26 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Status { admin } => match admin::query(&admin) {
+            Ok(json) => {
+                print!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("partizan is not running ({}: {e})", admin.display());
+                ExitCode::FAILURE
+            }
+        },
         Command::Run {
             uri,
             socks,
             level,
             honest,
+            admin,
         } => {
             logger::init(level);
             match runtime() {
-                Ok(rt) => rt.block_on(run(uri, socks, honest)),
+                Ok(rt) => rt.block_on(run(uri, socks, honest, admin)),
                 Err(e) => {
                     log::error!("runtime: {e}");
                     ExitCode::FAILURE
@@ -165,7 +189,7 @@ async fn check(uri: ConnectionUri) -> ExitCode {
     }
 }
 
-async fn run(uri: ConnectionUri, socks: SocketAddr, honest: bool) -> ExitCode {
+async fn run(uri: ConnectionUri, socks: SocketAddr, honest: bool, admin: PathBuf) -> ExitCode {
     let options = socks5::Options {
         honest_connect: honest,
         credentials: None,
@@ -182,6 +206,7 @@ async fn run(uri: ConnectionUri, socks: SocketAddr, honest: bool) -> ExitCode {
         }
     };
     let engine = engine(uri);
+    tokio::spawn(admin::serve(admin, engine.clone()));
     // Warm the session so the first connection does not wait for the handshake.
     if let Err(e) = engine.connect().await {
         log::warn!("initial connection failed, will retry on demand: {e}");
