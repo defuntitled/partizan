@@ -43,6 +43,15 @@ impl<'a> Reader<'a> {
         Ok(u16::from_be_bytes(self.array()?))
     }
 
+    pub(crate) fn u64_be(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+
+    /// True once every byte has been consumed.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+
     pub(crate) fn varint(&mut self) -> Result<u64, DecodeError> {
         let (value, len) = varint::decode(&self.buf[self.pos..])?;
         self.pos += len;

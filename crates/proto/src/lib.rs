@@ -2,18 +2,25 @@
 //!
 //! Independent of the OS, the async runtime and the clock (time is passed in), so it
 //! builds unchanged for mobile wrappers.
+//!
+//! Encoders write into a growable `BufMut` (`Vec<u8>`, `BytesMut`); a fixed-size buffer that
+//! runs out of space panics, as with any `BufMut`.
 
 #![forbid(unsafe_code)]
 
 pub mod addr;
 pub mod connect;
+pub mod control;
 mod error;
 mod reader;
+pub mod udp;
 pub mod varint;
 
 pub use addr::{Host, TargetAddr};
 pub use connect::{Connect, ConnectResult, ConnectStatus};
-pub use error::{DecodeError, EncodeError};
+pub use control::ControlFrame;
+pub use error::{DecodeError, EncodeError, ErrorCode};
+pub use udp::UdpDatagram;
 
 #[cfg(test)]
 mod tests {
