@@ -1,0 +1,9 @@
+services:
+  partizan:
+    image: partizan-server
+    network_mode: host          # UDP/443 and TCP/443 on the host, client addresses intact
+    restart: unless-stopped
+    stop_grace_period: 40s      # GoAway plus the 30 s drain
+    volumes:
+      - /etc/partizan:/etc/partizan
+      - /run/partizan:/run/partizan

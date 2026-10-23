@@ -1,0 +1,28 @@
+# /etc/partizan/server.toml
+[server]
+domain     = "cdn.example.com"
+listen     = "[::]:443"
+auth_path  = "/api/v2/sync"          # pick your own, it is part of every link
+devices    = "/etc/partizan/devices.toml"
+admin_sock = "/run/partizan/admin.sock"
+
+[tls]
+mode = "files"                        # certbot certonly --standalone -d cdn.example.com
+cert = "/etc/partizan/tls/fullchain.pem"
+key  = "/etc/partizan/tls/key.pem"
+
+[masquerade]
+mode = "static"
+# dir = "/var/www/site"              # a placeholder page without it
+
+[limits]
+sessions_per_device = 2
+udp_sessions_per_device = 512
+udp_idle_timeout = "60s"
+
+[egress]
+deny_private = true
+allow = []
+
+[metrics]
+listen = "127.0.0.1:9090"

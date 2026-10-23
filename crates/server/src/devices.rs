@@ -88,6 +88,11 @@ pub fn save(path: &Path, entries: &[Entry]) -> Result<(), String> {
             .open(&tmp)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
+        // Keep the owner of the existing file: the CLI often runs as root, the server does not.
+        if let Ok(meta) = std::fs::metadata(path) {
+            use std::os::unix::fs::MetadataExt;
+            let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
+        }
         std::fs::rename(&tmp, path)
     };
     write().map_err(|e| format!("{}: {e}", path.display()))

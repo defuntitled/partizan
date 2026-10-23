@@ -87,6 +87,7 @@ pub async fn start_with(
         },
         bench: Default::default(),
         masquerade: Default::default(),
+        metrics: Default::default(),
     };
     let server = Server::bind(config).await.unwrap();
     let addr = server.local_addr().unwrap();

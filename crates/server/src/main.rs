@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use server::Server;
 use server::config::Config;
@@ -149,10 +150,26 @@ fn run(path: PathBuf) -> ExitCode {
                 }
             }
         });
+        let shutdown = server.shutdown_handle();
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(term) => term,
+                Err(e) => {
+                    tracing::error!("signal handler: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let run = tokio::spawn(server.run());
         tokio::select! {
-            () = server.run() => {}
-            _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
         }
+        // Streams get 30 s to finish; clients come back in 5 s, to this or a new process.
+        shutdown
+            .run(Duration::from_secs(30), Duration::from_secs(5))
+            .await;
+        run.abort();
+        tracing::info!("stopped");
         ExitCode::SUCCESS
     })
 }

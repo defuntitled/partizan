@@ -78,6 +78,7 @@ pub async fn start_server(
         resolver: ResolverSection::default(),
         bench: Default::default(),
         masquerade: Default::default(),
+        metrics: Default::default(),
     };
     // A restart on the same port waits until the old endpoint's last handle lets go.
     let deadline = Instant::now() + Duration::from_secs(3);

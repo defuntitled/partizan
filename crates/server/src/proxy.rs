@@ -9,7 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use transport::{RecvHalf, SendHalf};
 
 use crate::State;
-use crate::dial::dial;
+use std::sync::atomic::Ordering;
+
+use crate::dial::{DialError, dial};
 
 /// Longest `Connect` header: type, 255-byte domain, port, padding.
 const MAX_HEADER: usize = 2048;
@@ -32,33 +34,50 @@ pub async fn handle_stream(
     }
 }
 
-async fn serve(mut send: SendHalf, mut recv: RecvHalf, state: &State) {
+async fn serve(send: SendHalf, recv: RecvHalf, state: &State) {
+    let m = &state.metrics;
+    m.streams_active.fetch_add(1, Ordering::Relaxed);
+    let result = proxy(send, recv, state).await;
+    m.streams_active.fetch_sub(1, Ordering::Relaxed);
+    m.stream(result);
+}
+
+/// Proxies one stream; returns its outcome as an index into `metrics::STREAM_RESULTS`.
+async fn proxy(mut send: SendHalf, mut recv: RecvHalf, state: &State) -> usize {
     let header = tokio::time::timeout(HEADER_TIMEOUT, read_header(&mut recv)).await;
     let (connect, early) = match header {
         Ok(Ok(Some(header))) => header,
-        Ok(Ok(None)) => return, // Closed before a header: nothing to do.
+        Ok(Ok(None)) => return 0, // Closed before a header: nothing to do.
         Ok(Err(code)) => {
             send.reset(code);
             recv.stop(code);
-            return;
+            return 5;
         }
         Err(_) => {
             send.reset(ErrorCode::PROTOCOL_ERROR);
             recv.stop(ErrorCode::PROTOCOL_ERROR);
-            return;
+            return 5;
         }
     };
     if state.bench_udp.is_some() && crate::bench::is_bench(&connect.addr) {
         crate::bench::serve(connect.addr.port, early, send, recv).await;
-        return;
+        return 0;
     }
-    let tcp = match dial(&connect.addr, &state.resolver, &state.egress).await {
+    let started = std::time::Instant::now();
+    let dialed = dial(&connect.addr, &state.resolver, &state.egress).await;
+    state.metrics.dial_duration.observe(started.elapsed());
+    let tcp = match dialed {
         Ok(tcp) => tcp,
         Err(e) => {
             tracing::debug!(target_addr = ?connect.addr, error = %e, "dial failed");
             send.reset(e.code());
             recv.stop(e.code());
-            return;
+            return match e {
+                DialError::NotAllowed => 1,
+                DialError::Unreachable => 2,
+                DialError::Refused => 3,
+                DialError::Timeout => 4,
+            };
         }
     };
     tracing::debug!(target_addr = ?connect.addr, "connected");
@@ -89,6 +108,7 @@ async fn serve(mut send: SendHalf, mut recv: RecvHalf, state: &State) {
         send.reset(ErrorCode::NO_ERROR);
         recv.stop(ErrorCode::NO_ERROR);
     }
+    0
 }
 
 /// Reads until a full `Connect` header; returns it and any bytes after it, `None` on a clean

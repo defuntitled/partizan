@@ -10,6 +10,7 @@ pub mod devices;
 pub mod dial;
 pub mod egress;
 pub mod masquerade;
+pub mod metrics;
 pub mod proxy;
 pub mod registry;
 pub mod sessions;
@@ -20,7 +21,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -64,25 +65,7 @@ pub enum ServerError {
     Io(#[from] io::Error),
 }
 
-/// Counters exported as metrics.
-#[derive(Debug, Default)]
-pub struct Metrics {
-    /// UDP replies larger than the client's datagram limit.
-    pub udp_oversize_drops: AtomicU64,
-    /// Undecodable datagrams, or a new UDP session without a destination.
-    pub udp_malformed_drops: AtomicU64,
-    /// Datagrams to destinations the egress policy refuses.
-    pub udp_denied_drops: AtomicU64,
-    /// QUIC connections accepted (authenticated or not).
-    pub connections: AtomicU64,
-}
-
-impl Metrics {
-    /// Current value of a counter.
-    pub fn get(counter: &AtomicU64) -> u64 {
-        counter.load(Ordering::Relaxed)
-    }
-}
+pub use metrics::Metrics;
 
 /// Shared state for all connections.
 pub struct State {
@@ -117,6 +100,15 @@ impl State {
             .clone()
     }
 
+    /// UDP sessions open now, all devices.
+    pub fn udp_sessions_active(&self) -> usize {
+        let map = self
+            .udp_per_device
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.values().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
     /// Shared UDP session counter of a device.
     fn udp_counter(&self, device: auth::DeviceId) -> Arc<AtomicUsize> {
         let mut map = self
@@ -139,6 +131,8 @@ impl State {
 /// Bound server, ready to [`Server::run`].
 pub struct Server {
     admin_sock: Option<PathBuf>,
+    metrics: Option<TcpListener>,
+    stop: Arc<tokio::sync::Notify>,
     endpoint: Endpoint,
     tcp: TcpListener,
     acceptor: TlsAcceptor,
@@ -219,8 +213,14 @@ impl Server {
                 None
             },
         };
+        let metrics = match config.metrics.listen {
+            Some(addr) => Some(metrics::bind(addr).await?),
+            None => None,
+        };
         Ok(Self {
             admin_sock: config.server.admin_sock.clone(),
+            metrics,
+            stop: Arc::new(tokio::sync::Notify::new()),
             endpoint,
             tcp,
             acceptor,
@@ -249,6 +249,20 @@ impl Server {
         self.endpoint.clone()
     }
 
+    /// Address of the metrics endpoint, if enabled.
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.metrics.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
+    /// Handle for a graceful shutdown while [`Server::run`] is running.
+    pub fn shutdown_handle(&self) -> Shutdown {
+        Shutdown {
+            endpoint: self.endpoint.clone(),
+            state: self.state.clone(),
+            stop: self.stop.clone(),
+        }
+    }
+
     /// Serves both listeners until the QUIC endpoint closes.
     pub async fn run(self) {
         // Renewed certificate files are picked up within the hour even without SIGHUP.
@@ -273,11 +287,23 @@ impl Server {
             };
             tokio::spawn(admin::serve(path, self.state.clone(), info));
         }
+        if let Some(listener) = self.metrics {
+            tokio::spawn(metrics::serve(listener, self.state.clone()));
+        }
         let tcp = {
-            let (tcp, acceptor, state) = (self.tcp, self.acceptor, self.state.clone());
+            let (tcp, acceptor, state, stop) = (
+                self.tcp,
+                self.acceptor,
+                self.state.clone(),
+                self.stop.clone(),
+            );
             tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = tcp.accept().await else {
+                    let accepted = tokio::select! {
+                        accepted = tcp.accept() => accepted,
+                        () = stop.notified() => return,
+                    };
+                    let Ok((stream, _)) = accepted else {
                         continue;
                     };
                     let (acceptor, state) = (acceptor.clone(), state.clone());
@@ -299,6 +325,47 @@ impl Server {
         }
         tcp.abort();
         reloader.abort();
+    }
+}
+
+/// Graceful shutdown: no new sessions, `GoAway(SERVER_SHUTDOWN)` to the live ones, then a
+/// drain for open streams.
+pub struct Shutdown {
+    endpoint: Endpoint,
+    state: Arc<State>,
+    stop: Arc<tokio::sync::Notify>,
+}
+
+impl Shutdown {
+    /// Runs the shutdown; returns once streams are done or `drain` has passed. Clients are told
+    /// to come back after `retry_after`.
+    pub async fn run(&self, drain: std::time::Duration, retry_after: std::time::Duration) {
+        // Refuse new QUIC connections and stop accepting TCP.
+        self.endpoint.set_server_config(None);
+        self.stop.notify_one();
+        let told = self.state.sessions.go_away(
+            None,
+            proto::ErrorCode::SERVER_SHUTDOWN,
+            retry_after.as_millis() as u64,
+        );
+        tracing::info!(sessions = told, "shutting down: draining streams");
+        let deadline = tokio::time::Instant::now() + drain;
+        while self.state.metrics.streams_active.load(Ordering::Relaxed) > 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        for (_, session) in self.state.sessions.list() {
+            session
+                .connection
+                .close(proto::ErrorCode::SERVER_SHUTDOWN, b"shutdown");
+        }
+        self.endpoint.close(
+            quinn::VarInt::from_u32(proto::ErrorCode::SERVER_SHUTDOWN.0 as u32),
+            b"shutdown",
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.endpoint.wait_idle())
+            .await;
     }
 }
 
@@ -406,7 +473,9 @@ async fn handle_tcp(
     let (mut tls, request, mut buf, used) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
         .await
         .map_err(|_| "auth timed out".to_owned())??;
-    match request.and_then(|r| check(&r, &state)) {
+    let result = request.and_then(|r| check(&r, &state));
+    state.metrics.auth(&result);
+    match result {
         Ok(accepted) => {
             let response = auth::accept_response(AuthTransport::Tls, &accepted.session);
             tls.write_all(&response).await.map_err(|e| e.to_string())?;
@@ -498,6 +567,10 @@ async fn run_session(
     datagrams.abort();
     reader.abort();
     nat.shutdown();
+    let stats = transport.stats();
+    state
+        .metrics
+        .session_closed(kind, stats.bytes_sent, stats.bytes_received);
     state.sessions.remove(sid);
     tracing::info!(sid = format_args!("{sid:x}"), "session ended");
 }
@@ -558,7 +631,9 @@ async fn first_stream(conn: &quinn::Connection, state: &State) -> Option<FirstSt
         let n = recv.read(&mut chunk).await.ok()??;
         buf.extend_from_slice(&chunk[..n]);
     };
-    match request.and_then(|r| check(&r, state)) {
+    let result = request.and_then(|r| check(&r, state));
+    state.metrics.auth(&result);
+    match result {
         Ok(accepted) => {
             let response = auth::accept_response(AuthTransport::Quic, &accepted.session);
             send.write_all(&response).await.ok()?;

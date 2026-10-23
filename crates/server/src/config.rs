@@ -35,6 +35,17 @@ pub struct Config {
     /// `[masquerade]`.
     #[serde(default)]
     pub masquerade: MasqueradeSection,
+    /// `[metrics]`.
+    #[serde(default)]
+    pub metrics: MetricsSection,
+}
+
+/// `[metrics]`: Prometheus endpoint, off unless `listen` is set (keep it on loopback).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetricsSection {
+    /// Address for `GET /metrics`.
+    pub listen: Option<SocketAddr>,
 }
 
 /// What visitors without a valid token get.
