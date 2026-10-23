@@ -12,6 +12,7 @@ pub mod addr;
 pub mod connect;
 pub mod control;
 mod error;
+pub mod mux;
 mod reader;
 pub mod udp;
 pub mod varint;

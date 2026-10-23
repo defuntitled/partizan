@@ -29,6 +29,13 @@ pub fn encode(value: u64, out: &mut impl BufMut) -> Result<(), EncodeError> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn encode_to_vec(value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode(value, &mut out).unwrap();
+    out
+}
+
 /// Decodes a varint from the front of `buf`, returning the value and bytes consumed.
 pub fn decode(buf: &[u8]) -> Result<(u64, usize), DecodeError> {
     let first = *buf.first().ok_or(DecodeError::Incomplete)?;

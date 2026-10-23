@@ -94,4 +94,6 @@ impl ErrorCode {
     pub const TARGET_TIMEOUT: Self = Self(0x12);
     /// Stream: denied by the egress policy (SOCKS5 REP 0x02).
     pub const NOT_ALLOWED: Self = Self(0x13);
+    /// Stream: refused, the peer is at its concurrent stream limit (SOCKS5 REP 0x01).
+    pub const STREAM_LIMIT: Self = Self(0x14);
 }
