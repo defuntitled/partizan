@@ -69,6 +69,7 @@ fn c05_t1_valid_token_establishes_with_agreed_caps_and_sid() {
         assert_eq!(accepted.client, info());
 
         let mut response = accept_response(transport, &accepted.session);
+        // `leftover` is opaque here; DATA framing of the QUIC control channel comes in C07.
         response.extend_from_slice(b"first control bytes");
         // Feed in two pieces to exercise buffering.
         let (a, b) = response.split_at(response.len() / 2);

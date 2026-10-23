@@ -393,10 +393,12 @@ pub fn authenticate(
     let record = registry.device(&device);
     let stored = record.map_or(TokenHash::DUMMY, |r| r.token_hash);
     let token_ok = stored.matches(&token.hash());
+    // Parsed before the path check too, so a wrong path skips no work.
+    let client = ClientInfo::parse(&request.client);
     if request.path != policy.auth_path {
         return Err(AuthFailure::WrongPath);
     }
-    let client = ClientInfo::parse(&request.client).ok_or(AuthFailure::Malformed)?;
+    let client = client.ok_or(AuthFailure::Malformed)?;
     let record = record.ok_or(AuthFailure::UnknownDevice)?;
     if !token_ok {
         return Err(AuthFailure::BadToken);

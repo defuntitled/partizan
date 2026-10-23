@@ -54,8 +54,10 @@ pub(crate) fn encode_response(status: u16, extra: &[(&str, &str)]) -> Zeroizing<
 /// `HEADERS` frame built in buffers sized up front, so no unzeroized copy of a field is left
 /// behind by reallocation.
 fn headers_frame(fields: &[(&str, &str)]) -> Zeroizing<Vec<u8>> {
-    let mut block = Zeroizing::new(Vec::with_capacity(qpack::encoded_len_bound(fields)));
+    let bound = qpack::encoded_len_bound(fields);
+    let mut block = Zeroizing::new(Vec::with_capacity(bound));
     qpack::encode(fields, &mut block);
+    debug_assert!(block.len() <= bound, "QPACK size bound too small");
     let mut out = Zeroizing::new(Vec::with_capacity(block.len() + 16));
     frame(FRAME_HEADERS, &block, &mut out);
     out

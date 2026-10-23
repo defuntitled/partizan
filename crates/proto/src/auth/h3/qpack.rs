@@ -72,10 +72,11 @@ pub(crate) fn decode(block: &[u8]) -> Result<Fields, ParseError> {
             return Err(ParseError::Malformed("QPACK dynamic table reference"));
         };
         size += name.len() + value.len() + 32;
+        // Pushed first so even this pair is wiped when `fields` drops on the error below.
+        fields.0.push((name, value));
         if size > MAX_SECTION {
             return Err(ParseError::TooLarge);
         }
-        fields.0.push((name, value));
     }
     Ok(fields)
 }
