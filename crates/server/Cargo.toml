@@ -1,0 +1,17 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "partizan-server"
+path = "src/main.rs"
+
+[dependencies]
+proto.workspace = true
+transport.workspace = true
+
+[lints]
+workspace = true

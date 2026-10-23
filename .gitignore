@@ -1,0 +1,11 @@
+
+# AI assistant artifacts
+context-snapshot.json
+.claude
+.agents
+session-log.md
+skills-lock.json
+
+
+# Build output
+/target

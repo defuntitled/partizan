@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+proto = { path = "crates/proto" }
+transport = { path = "crates/transport" }
+client-core = { path = "crates/client-core" }
+socks5 = { path = "crates/socks5" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+# Server: `cargo build --release -p server`.
+[profile.release]
+opt-level = 3
+
+# Router client (N5: ≤ 5 MB stripped): `cargo build --profile release-client -p client-openwrt`.
+[profile.release-client]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
