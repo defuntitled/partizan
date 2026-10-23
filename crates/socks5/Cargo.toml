@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes.workspace = true
 client-core.workspace = true
 log.workspace = true
 proto.workspace = true

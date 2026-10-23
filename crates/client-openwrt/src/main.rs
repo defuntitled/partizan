@@ -186,6 +186,7 @@ async fn run(uri: ConnectionUri, socks: SocketAddr, honest: bool) -> ExitCode {
     if let Err(e) = engine.connect().await {
         log::warn!("initial connection failed, will retry on demand: {e}");
     }
+    let socks = listener.local_addr().unwrap_or(socks);
     log::info!("SOCKS5 on {socks}");
     let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(term) => term,

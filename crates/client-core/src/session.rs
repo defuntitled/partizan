@@ -5,14 +5,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use proto::auth::{
-    ClientHandshake, ClientInfo, ConnectionUri, HANDSHAKE_TIMEOUT, HandshakeError, SessionInfo,
-    Transport as AuthTransport, client_control_stream,
+    ClientHandshake, ClientInfo, ConnectionUri, DataFrameReader, HANDSHAKE_TIMEOUT, HandshakeError,
+    SessionInfo, Transport as AuthTransport, client_control_stream, encode_data_frame,
 };
+use proto::control::ControlReader;
+use proto::{ControlFrame, UdpDatagram};
 use quinn::Endpoint;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::AbortHandle;
 use transport::quic::{self, QuicTransport};
 use transport::tls::{self, ALPN_H3, ServerVerification};
 use transport::{QuicConfig, Transport, TransportStats};
+
+use crate::udp::UdpRegistry;
 
 /// What the engine needs to reach the server.
 #[derive(Debug, Clone)]
@@ -56,16 +61,25 @@ pub struct Status {
 pub(crate) struct Session {
     pub(crate) transport: QuicTransport,
     pub(crate) info: SessionInfo,
-    // Kept open for the session's lifetime: the endpoint socket, the HTTP/3 control stream and
-    // the auth stream that carries the control channel.
+    /// Frames to send on the control channel.
+    pub(crate) control: mpsc::Sender<ControlFrame>,
+    // Kept open for the session's lifetime: the endpoint socket and the HTTP/3 control stream.
     _endpoint: Endpoint,
     _h3_control: quinn::SendStream,
-    _control: (quinn::SendStream, quinn::RecvStream),
+    tasks: Vec<AbortHandle>,
 }
 
 impl Session {
-    fn is_alive(&self) -> bool {
+    pub(crate) fn is_alive(&self) -> bool {
         self.transport.connection().close_reason().is_none()
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -77,7 +91,8 @@ pub struct Engine {
 
 pub(crate) struct Inner {
     config: EngineConfig,
-    session: Mutex<Option<Arc<Session>>>,
+    pub(crate) session: Mutex<Option<Arc<Session>>>,
+    pub(crate) udp: Arc<UdpRegistry>,
 }
 
 impl Engine {
@@ -87,6 +102,7 @@ impl Engine {
             inner: Arc::new(Inner {
                 config,
                 session: Mutex::new(None),
+                udp: Arc::new(UdpRegistry::default()),
             }),
         }
     }
@@ -102,7 +118,10 @@ impl Engine {
         if let Some(session) = slot.as_ref().filter(|s| s.is_alive()) {
             return Ok(session.clone());
         }
-        let session = Arc::new(establish(&self.inner.config).await?);
+        let session = Arc::new(establish(&self.inner.config, self.inner.udp.clone()).await?);
+        // UDP sessions of the old connection are gone on the server; the next datagram of every
+        // flow carries its address again.
+        self.inner.udp.reset_all();
         *slot = Some(session.clone());
         Ok(session)
     }
@@ -128,7 +147,7 @@ impl Engine {
 }
 
 /// Resolves the server, connects over QUIC and runs the auth exchange.
-async fn establish(config: &EngineConfig) -> Result<Session, EngineError> {
+async fn establish(config: &EngineConfig, udp: Arc<UdpRegistry>) -> Result<Session, EngineError> {
     let uri = &config.uri;
     let addr = resolve(&uri.host, uri.port).await?;
     let tls = tls::client_config(ServerVerification::from_uri(uri), &[ALPN_H3])
@@ -164,13 +183,20 @@ async fn establish(config: &EngineConfig) -> Result<Session, EngineError> {
                 return Err(EngineError::Handshake(HandshakeError::Rejected));
             }
             if let Some(established) = handshake.handle_input(&buf[..n])? {
-                return Ok((established.session, h3_control, send, recv));
+                return Ok((established, h3_control, send, recv));
             }
         }
     };
-    let (info, h3_control, send, recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, auth)
+    let (established, h3_control, send, recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, auth)
         .await
         .map_err(|_| EngineError::Handshake(HandshakeError::Timeout))??;
+    let info = established.session;
+    let (control, control_rx) = mpsc::channel(64);
+    let tasks = vec![
+        tokio::spawn(write_control(send, control_rx)).abort_handle(),
+        tokio::spawn(read_control(recv, established.leftover, udp.clone())).abort_handle(),
+        tokio::spawn(read_datagrams(transport.clone(), udp)).abort_handle(),
+    ];
     log::info!(
         "session up via QUIC to {addr} in {} ms (sid {:x}, caps {:x})",
         started.elapsed().as_millis(),
@@ -180,10 +206,58 @@ async fn establish(config: &EngineConfig) -> Result<Session, EngineError> {
     Ok(Session {
         transport,
         info,
+        control,
         _endpoint: endpoint,
         _h3_control: h3_control,
-        _control: (send, recv),
+        tasks,
     })
+}
+
+/// Sends control frames, each in an HTTP/3 `DATA` frame on the auth stream.
+async fn write_control(mut send: quinn::SendStream, mut frames: mpsc::Receiver<ControlFrame>) {
+    while let Some(frame) = frames.recv().await {
+        let mut body = Vec::new();
+        if frame.encode(&mut body).is_ok()
+            && send.write_all(&encode_data_frame(&body)).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Handles the server's control frames.
+async fn read_control(mut recv: quinn::RecvStream, leftover: Vec<u8>, udp: Arc<UdpRegistry>) {
+    let (mut data, mut frames) = (DataFrameReader::default(), ControlReader::default());
+    let mut bytes = leftover;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let Ok(payload) = data.push(&bytes) else {
+            return;
+        };
+        let Ok(parsed) = frames.push(&payload) else {
+            return;
+        };
+        for frame in parsed {
+            if let ControlFrame::UdpClose { session_id, reason } = frame {
+                log::debug!("server closed UDP session {session_id} (reason {reason})");
+                udp.server_closed(session_id);
+            }
+        }
+        match recv.read(&mut buf).await {
+            Ok(Some(n)) => bytes = buf[..n].to_vec(),
+            _ => return,
+        }
+    }
+}
+
+/// Hands incoming datagrams to their UDP flows.
+async fn read_datagrams(transport: QuicTransport, udp: Arc<UdpRegistry>) {
+    while let Ok(raw) = transport.recv_datagram().await {
+        match UdpDatagram::decode(raw) {
+            Ok(datagram) => udp.deliver(datagram),
+            Err(_) => log::debug!("malformed datagram from the server dropped"),
+        }
+    }
 }
 
 fn io(e: impl std::fmt::Display) -> EngineError {

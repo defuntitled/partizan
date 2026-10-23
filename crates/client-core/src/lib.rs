@@ -7,9 +7,11 @@
 
 mod session;
 mod tcp;
+mod udp;
 
 pub use session::{Engine, EngineConfig, EngineError, Status};
 pub use tcp::{AsyncReadWrite, ConnectError, TcpRequest, relay};
+pub use udp::{UdpFlow, UdpReply, UdpSendError};
 
 #[cfg(test)]
 mod tests {

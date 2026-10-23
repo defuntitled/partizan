@@ -1,5 +1,7 @@
-//! Traffic source: SOCKS5 (RFC 1928) `CONNECT` and, later, `UDP ASSOCIATE`, feeding
-//! `client-core`. Domain names are passed on unresolved.
+//! Traffic source: SOCKS5 (RFC 1928) `CONNECT` and `UDP ASSOCIATE`, feeding `client-core`.
+//! Domain names are passed on unresolved.
+
+mod udp;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -15,6 +17,7 @@ const METHOD_NONE: u8 = 0x00;
 const METHOD_PASSWORD: u8 = 0x02;
 const METHOD_UNACCEPTABLE: u8 = 0xff;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 
 /// `REP` codes (RFC 1928 §6).
 pub mod reply {
@@ -98,10 +101,14 @@ async fn handle(mut stream: TcpStream, engine: &Engine, options: &Options) -> Re
         }
         Err(RequestError::Other(e)) => return Err(e),
     };
-    if request.command != CMD_CONNECT {
-        // BIND is not supported; UDP ASSOCIATE arrives with C11.
-        write_reply(&mut stream, reply::COMMAND_NOT_SUPPORTED).await?;
-        return Ok(());
+    match request.command {
+        CMD_CONNECT => {}
+        CMD_UDP_ASSOCIATE => return udp::associate(stream, engine).await,
+        // BIND is not supported.
+        _ => {
+            write_reply(&mut stream, reply::COMMAND_NOT_SUPPORTED).await?;
+            return Ok(());
+        }
     }
     match engine
         .open_tcp(request.target.clone(), options.honest_connect)
@@ -230,9 +237,28 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request, R
 
 /// Reply with `BND.ADDR` 0.0.0.0:0; clients of a CONNECT proxy ignore it.
 async fn write_reply<S: AsyncWrite + Unpin>(stream: &mut S, rep: u8) -> std::io::Result<()> {
-    stream
-        .write_all(&[VERSION, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await
+    write_reply_bound(stream, rep, SocketAddr::from(([0, 0, 0, 0], 0))).await
+}
+
+/// Reply naming the bound address (the relay socket for `UDP ASSOCIATE`).
+async fn write_reply_bound<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    rep: u8,
+    bound: SocketAddr,
+) -> std::io::Result<()> {
+    let mut out = vec![VERSION, rep, 0x00];
+    match bound {
+        SocketAddr::V4(v4) => {
+            out.push(0x01);
+            out.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            out.push(0x04);
+            out.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    out.extend_from_slice(&bound.port().to_be_bytes());
+    stream.write_all(&out).await
 }
 
 /// Listen address helper for binaries: loopback unless credentials are set.

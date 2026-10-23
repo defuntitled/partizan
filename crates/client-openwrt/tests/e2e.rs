@@ -98,27 +98,39 @@ impl Drop for Client {
 }
 
 async fn start_client(uri: &PathBuf, extra: &[&str]) -> Client {
-    let socks = StdListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // Port 0: the client picks a free port and logs it, so parallel tests never collide.
     let child = Command::new(env!("CARGO_BIN_EXE_partizan"))
         .args(["run", "--uri-file"])
         .arg(uri)
-        .args(["--socks", &socks.to_string(), "--log-level", "warn"])
+        .args(["--socks", "127.0.0.1:0", "--log-level", "info"])
         .args(extra)
         .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // Owned by `Client` from here, so a failed wait below still reaps it.
-    let client = Client { child, socks };
-    for _ in 0..100 {
-        if TcpStream::connect(socks).await.is_ok() {
-            return client;
+    let mut client = Client {
+        child,
+        socks: "0.0.0.0:0".parse().unwrap(),
+    };
+    let stderr = client.child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Some(addr) = line.strip_prefix("info: SOCKS5 on ") {
+                let _ = tx.send(addr.parse::<SocketAddr>().unwrap());
+            }
+            // Keep draining so the client never blocks on a full pipe.
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("client did not open SOCKS on {socks}");
+    });
+    client.socks = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("client did not report its SOCKS address");
+    client
 }
 
 /// SOCKS5 CONNECT with no auth; returns the stream and the `REP` code.
@@ -309,4 +321,173 @@ async fn c09_t6_check_passes_on_a_valid_uri_and_fails_on_a_bad_one() {
     // The token never appears in what the user sees.
     let token = Token::from_bytes([0; 32]).to_base64url();
     assert!(!stdout.contains(token.as_str()));
+}
+
+/// Opens a UDP association; returns the control connection (keep it open) and the relay.
+async fn socks_udp_associate(socks: SocketAddr) -> (TcpStream, SocketAddr) {
+    let mut s = TcpStream::connect(socks).await.unwrap();
+    s.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0u8; 2];
+    s.read_exact(&mut method).await.unwrap();
+    s.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0, "UDP ASSOCIATE refused");
+    let relay = SocketAddr::from((
+        Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    ));
+    (s, relay)
+}
+
+/// SOCKS5 UDP request header for an IPv4 destination.
+fn udp_header(frag: u8, dst: SocketAddr) -> Vec<u8> {
+    let SocketAddr::V4(v4) = dst else {
+        panic!("IPv4 only")
+    };
+    [
+        &[0u8, 0, frag, 1][..],
+        &v4.ip().octets(),
+        &v4.port().to_be_bytes(),
+    ]
+    .concat()
+}
+
+async fn udp_reply(socket: &tokio::net::UdpSocket) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    Some(buf[..n].to_vec())
+}
+
+/// Answers DNS-shaped queries: same ID, QR bit set; records every source it saw.
+async fn fake_dns() -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            let query = buf[..n].to_vec();
+            let _ = tx.send((from, query.clone()));
+            if n >= 12 {
+                let mut answer = query;
+                answer[2] |= 0x80; // QR: response.
+                let _ = socket.send_to(&answer, from).await;
+            }
+        }
+    });
+    (addr, rx)
+}
+
+/// A DNS query for example.com A with transaction id `id`.
+fn dns_query(id: u16) -> Vec<u8> {
+    let mut q = id.to_be_bytes().to_vec();
+    q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    q.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+    q
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c11_t1_dns_query_through_udp_associate() {
+    let uri = start_server(TOKEN).await;
+    let client = start_client(&uri, &[]).await;
+    let (dns, _) = fake_dns().await;
+    let (_control, relay) = socks_udp_associate(client.socks).await;
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    app.send_to(&[udp_header(0, dns), dns_query(0xbeef)].concat(), relay)
+        .await
+        .unwrap();
+    let reply = udp_reply(&app).await.expect("DNS answer");
+    let header = udp_header(0, dns);
+    assert_eq!(
+        &reply[..header.len()],
+        &header[..],
+        "reply names the DNS server as source"
+    );
+    let answer = &reply[header.len()..];
+    assert_eq!(&answer[..2], &0xbeefu16.to_be_bytes());
+    assert_ne!(answer[2] & 0x80, 0, "QR set");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c11_t2_two_sources_get_separate_udp_sessions() {
+    let uri = start_server(TOKEN).await;
+    let client = start_client(&uri, &[]).await;
+    let (dns, mut seen) = fake_dns().await;
+    let (_control, relay) = socks_udp_associate(client.socks).await;
+    let a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    a.send_to(&[udp_header(0, dns), dns_query(1)].concat(), relay)
+        .await
+        .unwrap();
+    b.send_to(&[udp_header(0, dns), dns_query(2)].concat(), relay)
+        .await
+        .unwrap();
+    // Each source gets only its own answer.
+    let ra = udp_reply(&a).await.unwrap();
+    let rb = udp_reply(&b).await.unwrap();
+    let hl = udp_header(0, dns).len();
+    assert_eq!(&ra[hl..hl + 2], &1u16.to_be_bytes());
+    assert_eq!(&rb[hl..hl + 2], &2u16.to_be_bytes());
+    // Separate UDP sessions on the server: two NAT sockets, two source ports.
+    let (from1, _) = seen.recv().await.unwrap();
+    let (from2, _) = seen.recv().await.unwrap();
+    assert_ne!(from1, from2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c11_t3_closing_the_control_connection_ends_the_association() {
+    let uri = start_server(TOKEN).await;
+    let client = start_client(&uri, &[]).await;
+    let (dns, _) = fake_dns().await;
+    let (control, relay) = socks_udp_associate(client.socks).await;
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    app.connect(relay).await.unwrap();
+    app.send(&[udp_header(0, dns), dns_query(3)].concat())
+        .await
+        .unwrap();
+    assert!(udp_reply(&app).await.is_some());
+    drop(control);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The relay socket is gone: the kernel answers with port unreachable.
+    app.send(&[udp_header(0, dns), dns_query(4)].concat())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let after = tokio::time::timeout(Duration::from_secs(2), app.recv(&mut buf)).await;
+    assert!(
+        matches!(after, Ok(Err(_)) | Err(_)),
+        "relay still answering: {after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c11_t4_fragments_are_dropped() {
+    let uri = start_server(TOKEN).await;
+    let client = start_client(&uri, &[]).await;
+    let (dns, mut seen) = fake_dns().await;
+    let (_control, relay) = socks_udp_associate(client.socks).await;
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    app.send_to(&[udp_header(1, dns), dns_query(5)].concat(), relay)
+        .await
+        .unwrap();
+    app.send_to(&[udp_header(0, dns), dns_query(6)].concat(), relay)
+        .await
+        .unwrap();
+    let reply = udp_reply(&app).await.unwrap();
+    let hl = udp_header(0, dns).len();
+    assert_eq!(
+        &reply[hl..hl + 2],
+        &6u16.to_be_bytes(),
+        "only the unfragmented query went through"
+    );
+    let (_, query) = seen.recv().await.unwrap();
+    assert_eq!(&query[..2], &6u16.to_be_bytes());
+    assert!(seen.try_recv().is_err());
 }
