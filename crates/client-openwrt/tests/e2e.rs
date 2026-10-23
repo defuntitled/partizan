@@ -32,6 +32,11 @@ fn temp_dir() -> PathBuf {
 
 /// Starts a server allowing loopback targets; returns a URI file for the client.
 async fn start_server(token: [u8; 32]) -> PathBuf {
+    start_server_with(token, TransportMode::Quic).await
+}
+
+/// Like [`start_server`], with the URI asking for `transport`.
+async fn start_server_with(token: [u8; 32], transport: TransportMode) -> PathBuf {
     let dir = temp_dir();
     let devices = dir.join("devices.toml");
     let hash = Token::from_bytes(TOKEN).hash().to_hex();
@@ -75,7 +80,7 @@ async fn start_server(token: [u8; 32]) -> PathBuf {
         sni: Some("localhost".into()),
         path: "/api/v2/sync".into(),
         pin: Some(server.pin()),
-        transport: TransportMode::Quic,
+        transport,
         insecure: false,
         passthrough: None,
     };
@@ -577,5 +582,102 @@ async fn c15_bench_reports_throughput_and_latency() {
         "Mbit/s",
     ] {
         assert!(stdout.contains(line), "missing {line:?} in\n{stdout}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c16_t1_curl_over_tcp_tls() {
+    if Command::new("curl")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("curl not installed; skipping");
+        return;
+    }
+    let uri = start_server_with(TOKEN, TransportMode::Tls).await;
+    let client = start_client(&uri, &[]).await;
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = http.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = http.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = tcp.read(&mut buf).await;
+                let body = "hello over tls";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tcp.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            "--socks5-hostname",
+            &client.socks.to_string(),
+        ])
+        .arg(format!("http://localhost:{port}/"))
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hello over tls",
+        "{output:?}"
+    );
+    // The session really is TCP+TLS.
+    let status = admin_status(&client.admin).await;
+    assert!(status.contains("\"transport\":\"tls\""), "{status}");
+}
+
+async fn admin_status(admin: &PathBuf) -> String {
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_partizan"))
+        .args(["status", "--admin-sock"])
+        .arg(admin)
+        .output()
+        .await
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c16_t2_udp_and_dns_over_mux_datagrams() {
+    let uri = start_server_with(TOKEN, TransportMode::Tls).await;
+    let client = start_client(&uri, &[]).await;
+    let (dns, _) = fake_dns().await;
+    let (_control, relay) = socks_udp_associate(client.socks).await;
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    app.send_to(&[udp_header(0, dns), dns_query(0x1616)].concat(), relay)
+        .await
+        .unwrap();
+    let reply = udp_reply(&app).await.expect("answer over TCP+TLS");
+    let hl = udp_header(0, dns).len();
+    assert_eq!(&reply[hl..hl + 2], &0x1616u16.to_be_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c16_t3_parallel_streams_do_not_mix() {
+    let uri = start_server_with(TOKEN, TransportMode::Tls).await;
+    let client = start_client(&uri, &[]).await;
+    let echo = echo_server("127.0.0.1:0").await.unwrap();
+    let tasks: Vec<_> = (0..8u8)
+        .map(|i| {
+            let socks = client.socks;
+            tokio::spawn(async move {
+                let (s, rep) = socks_connect(socks, &v4(Ipv4Addr::LOCALHOST), echo.port()).await;
+                assert_eq!(rep, 0);
+                let data = vec![i; 300 * 1024];
+                assert_eq!(roundtrip(s, &data).await, data, "stream {i}");
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
     }
 }

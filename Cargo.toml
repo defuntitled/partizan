@@ -32,6 +32,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 webpki-roots = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 lexopt = "0.3"
 log = "0.4"

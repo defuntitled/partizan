@@ -1,5 +1,6 @@
-//! partizan server: accepts device sessions over QUIC, authenticates them against the
-//! registry and opens their TCP connections from the server's address.
+//! partizan server: accepts device sessions over QUIC (UDP/443) and TCP+TLS (TCP/443),
+//! authenticates them against the registry and opens their connections from the server's
+//! address.
 
 pub mod bench;
 pub mod config;
@@ -23,17 +24,21 @@ use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{LookupIpStrategy, ResolveHosts};
 use proto::ControlFrame;
 use proto::auth::{
-    self, AuthRequest, Caps, DataFrameReader, HANDSHAKE_TIMEOUT, ServerPolicy,
-    Transport as AuthTransport, encode_data_frame,
+    self, AuthRequest, Caps, HANDSHAKE_TIMEOUT, ServerPolicy, Transport as AuthTransport,
 };
 use proto::control::ControlReader;
+use proto::mux::Role;
 use quinn::{Endpoint, Incoming};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use transport::Transport;
-use transport::quic::{self, QuicTransport};
-use transport::tls::{self, ALPN_H3};
+use tokio_rustls::TlsAcceptor;
+use transport::quic::{self, QuicControl, QuicTransport};
+use transport::tcp::MuxTransport;
+use transport::tls::{self, ALPN_H3, ALPN_HTTP11};
+use transport::{ControlChannel, Transport};
 
 use crate::config::{Config, TlsMode};
 use crate::egress::EgressPolicy;
@@ -125,6 +130,8 @@ impl State {
 /// Bound server, ready to [`Server::run`].
 pub struct Server {
     endpoint: Endpoint,
+    tcp: TcpListener,
+    acceptor: TlsAcceptor,
     state: Arc<State>,
     pin: [u8; 32],
 }
@@ -135,9 +142,16 @@ impl Server {
         let (chain, key) = load_certificate(&config)?;
         let pin = tls::spki_pin(&chain[0])
             .ok_or_else(|| ServerError::Config("certificate without SPKI".into()))?;
-        let tls = tls::server_config(chain, key, &[ALPN_H3])
-            .map_err(|e| ServerError::Config(e.to_string()))?;
-        let endpoint = quic::server_endpoint(config.server.listen, tls, &config.quic)?;
+        let bad_tls = |e: rustls::Error| ServerError::Config(e.to_string());
+        let quic_tls =
+            tls::server_config(chain.clone(), key.clone_key(), &[ALPN_H3]).map_err(bad_tls)?;
+        let tcp_tls = tls::server_config(chain, key, &[ALPN_HTTP11]).map_err(bad_tls)?;
+        let endpoint = quic::server_endpoint(config.server.listen, quic_tls, &config.quic)?;
+        // TCP on the same port as UDP, also when the config asked for port 0.
+        let mut tcp_addr = config.server.listen;
+        tcp_addr.set_port(endpoint.local_addr()?.port());
+        let tcp = TcpListener::bind(tcp_addr).await?;
+        let acceptor = TlsAcceptor::from(Arc::new(tcp_tls));
         let registry = Registry::load(&config.server.devices).map_err(ServerError::Config)?;
         let mut resolver =
             TokioResolver::builder_tokio().map_err(|e| ServerError::Config(e.to_string()))?;
@@ -175,6 +189,8 @@ impl Server {
         };
         Ok(Self {
             endpoint,
+            tcp,
+            acceptor,
             state: Arc::new(state),
             pin,
         })
@@ -200,16 +216,33 @@ impl Server {
         self.endpoint.clone()
     }
 
-    /// Serves connections until the endpoint closes.
+    /// Serves both listeners until the QUIC endpoint closes.
     pub async fn run(self) {
+        let tcp = {
+            let (tcp, acceptor, state) = (self.tcp, self.acceptor, self.state.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = tcp.accept().await else {
+                        continue;
+                    };
+                    let (acceptor, state) = (acceptor.clone(), state.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_tcp(stream, acceptor, state).await {
+                            tracing::debug!(error = %e, "TCP connection ended");
+                        }
+                    });
+                }
+            })
+        };
         while let Some(incoming) = self.endpoint.accept().await {
             let state = self.state.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(incoming, state).await {
+                if let Err(e) = handle_quic(incoming, state).await {
                     tracing::debug!(error = %e, "connection ended");
                 }
             });
         }
+        tcp.abort();
     }
 }
 
@@ -256,8 +289,8 @@ fn load_certificate(
     }
 }
 
-/// Authenticates one QUIC connection and serves its streams.
-async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), String> {
+/// Authenticates one QUIC connection and serves it.
+async fn handle_quic(incoming: Incoming, state: Arc<State>) -> Result<(), String> {
     let conn = incoming.await.map_err(|e| e.to_string())?;
     state.metrics.connections.fetch_add(1, Ordering::Relaxed);
     // The client's HTTP/3 control stream and any other unidirectional streams: read and drop.
@@ -269,21 +302,93 @@ async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), 
             );
         }
     });
-    let authed = tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(&conn, &state)).await;
-    let Ok(Some((accepted, auth_send, auth_recv))) = authed else {
+    let authed = tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate_quic(&conn, &state)).await;
+    let Ok(Some((accepted, send, recv))) = authed else {
         // Like a web server after a 404: let the response reach the client and leave closing
         // to it, within the handshake timeout.
         let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.closed()).await;
         conn.close(0u32.into(), b"");
         return Err("not authenticated".into());
     };
+    let transport: Arc<dyn Transport> = Arc::new(QuicTransport::new(conn));
+    let control = Arc::new(QuicControl::new(send, recv, Vec::new()));
+    run_session(state, accepted, "quic", transport, control).await;
+    Ok(())
+}
+
+/// Authenticates one TCP+TLS connection (HTTP/1.1 `Upgrade`) and serves it over the mux.
+async fn handle_tcp(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    state: Arc<State>,
+) -> Result<(), String> {
+    state.metrics.connections.fetch_add(1, Ordering::Relaxed);
+    stream.set_nodelay(true).ok();
+    let peer = stream.peer_addr().map_err(|e| e.to_string())?;
+    let handshake = async {
+        let mut tls = acceptor.accept(stream).await.map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let (request, used) = loop {
+            match AuthRequest::decode(AuthTransport::Tls, &buf) {
+                Ok(Some((request, used))) => break (Ok(request), used),
+                Ok(None) => {}
+                Err(failure) => break (Err(failure), buf.len()),
+            }
+            let n = tls.read(&mut chunk).await.map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("closed during auth".to_owned());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        Ok((tls, request, buf.split_off(used)))
+    };
+    let (mut tls, request, leftover) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .map_err(|_| "auth timed out".to_owned())??;
+    match request.and_then(|r| check(&r, &state)) {
+        Ok(accepted) => {
+            let response = auth::accept_response(AuthTransport::Tls, &accepted.session);
+            tls.write_all(&response).await.map_err(|e| e.to_string())?;
+            let mux = MuxTransport::new(tls, Role::Server, &leftover);
+            let transport: Arc<dyn Transport> = Arc::new(mux.clone());
+            run_session(state, accepted, "tls", transport, Arc::new(mux)).await;
+            Ok(())
+        }
+        Err(failure) => {
+            tracing::info!(reason = %failure, remote = %peer, "auth rejected (tcp)");
+            let _ = tls
+                .write_all(&auth::not_found_response(AuthTransport::Tls))
+                .await;
+            let _ = tls.shutdown().await;
+            Err("not authenticated".into())
+        }
+    }
+}
+
+/// Registry check with a fresh session id.
+fn check(request: &AuthRequest, state: &State) -> Result<auth::Accepted, auth::AuthFailure> {
+    let mut sid = [0u8; 8];
+    getrandom::fill(&mut sid).map_err(|_| auth::AuthFailure::Malformed)?;
+    let registry = state.registry();
+    auth::authenticate(request, &*registry, &state.policy, u64::from_be_bytes(sid))
+}
+
+/// Serves an authenticated session on either transport until it ends.
+async fn run_session(
+    state: Arc<State>,
+    accepted: auth::Accepted,
+    kind: &'static str,
+    transport: Arc<dyn Transport>,
+    control: Arc<dyn ControlChannel>,
+) {
     let sid = accepted.session.sid;
     let name = state
         .registry()
         .get(&accepted.device)
         .map(|d| d.name.clone())
         .unwrap_or_default();
-    tracing::info!(device = %accepted.device, name = %name, sid = format_args!("{sid:x}"), "session started");
+    tracing::info!(device = %accepted.device, name = %name, transport = kind, sid = format_args!("{sid:x}"), "session started");
     let (control_tx, control_rx) = mpsc::channel(64);
     state.sessions.insert(
         sid,
@@ -292,14 +397,13 @@ async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), 
             name,
             platform: accepted.client.platform,
             client_version: accepted.client.client_version,
-            transport: "quic",
+            transport: kind,
             started: Instant::now(),
             control: control_tx.clone(),
-            conn: conn.clone(),
+            connection: transport.clone(),
         },
     );
-    let transport = QuicTransport::new(conn);
-    tokio::spawn(write_control(auth_send, control_rx));
+    tokio::spawn(write_control(control.clone(), control_rx));
     let nat = UdpNat::new(
         transport.clone(),
         state.clone(),
@@ -307,7 +411,7 @@ async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), 
         state.udp,
         state.udp_counter(accepted.device),
     );
-    tokio::spawn(read_control(auth_recv, nat.clone(), control_tx));
+    let reader = tokio::spawn(read_control(control, nat.clone(), control_tx));
     let datagrams = {
         let (transport, nat) = (transport.clone(), nat.clone());
         tokio::spawn(async move {
@@ -317,30 +421,26 @@ async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), 
         })
     };
     while let Ok((send, recv)) = transport.accept_stream().await {
-        let state = state.clone();
-        let conn = transport.connection().clone();
+        let (state, transport) = (state.clone(), transport.clone());
         tokio::spawn(async move {
             let closed = async move {
-                conn.closed().await;
+                transport.closed().await;
             };
             proxy::handle_stream(send, recv, &state, closed).await;
         });
     }
     datagrams.abort();
+    reader.abort();
     nat.shutdown();
     state.sessions.remove(sid);
     tracing::info!(sid = format_args!("{sid:x}"), "session ended");
-    Ok(())
 }
 
-/// Writes control frames to the client, each in an HTTP/3 `DATA` frame on the auth stream.
-async fn write_control(mut send: quinn::SendStream, mut frames: mpsc::Receiver<ControlFrame>) {
+/// Writes control frames to the client.
+async fn write_control(control: Arc<dyn ControlChannel>, mut frames: mpsc::Receiver<ControlFrame>) {
     while let Some(frame) = frames.recv().await {
         let mut body = Vec::new();
-        if frame.encode(&mut body).is_err() {
-            continue;
-        }
-        if send.write_all(&encode_data_frame(&body)).await.is_err() {
+        if frame.encode(&mut body).is_ok() && control.send(body).await.is_err() {
             return;
         }
     }
@@ -348,16 +448,12 @@ async fn write_control(mut send: quinn::SendStream, mut frames: mpsc::Receiver<C
 
 /// Serves the client's control frames: answers `Ping`, closes UDP sessions on `UdpClose`.
 async fn read_control(
-    mut recv: quinn::RecvStream,
+    control: Arc<dyn ControlChannel>,
     nat: Arc<UdpNat>,
     reply: mpsc::Sender<ControlFrame>,
 ) {
-    let (mut data, mut frames) = (DataFrameReader::default(), ControlReader::default());
-    let mut buf = vec![0u8; 4096];
-    while let Ok(Some(n)) = recv.read(&mut buf).await {
-        let Ok(bytes) = data.push(&buf[..n]) else {
-            return;
-        };
+    let mut frames = ControlReader::default();
+    while let Some(bytes) = control.recv().await {
         let Ok(parsed) = frames.push(&bytes) else {
             return;
         };
@@ -376,7 +472,7 @@ async fn read_control(
 }
 
 /// Reads the auth request from the first bidi stream; answers success or `404`.
-async fn authenticate(
+async fn authenticate_quic(
     conn: &quinn::Connection,
     state: &State,
 ) -> Option<(auth::Accepted, quinn::SendStream, quinn::RecvStream)> {
@@ -392,12 +488,7 @@ async fn authenticate(
         let n = recv.read(&mut chunk).await.ok()??;
         buf.extend_from_slice(&chunk[..n]);
     };
-    let mut sid = [0u8; 8];
-    getrandom::fill(&mut sid).ok()?;
-    let registry = state.registry();
-    let result = request
-        .and_then(|r| auth::authenticate(&r, &*registry, &state.policy, u64::from_be_bytes(sid)));
-    match result {
+    match request.and_then(|r| check(&r, state)) {
         Ok(accepted) => {
             let response = auth::accept_response(AuthTransport::Quic, &accepted.session);
             send.write_all(&response).await.ok()?;

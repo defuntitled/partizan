@@ -150,6 +150,8 @@ struct Stream {
     unacked: u64,
     fin_received: bool,
     fin_delivered: bool,
+    /// The application stopped reading; data is discarded and credited back.
+    read_closed: bool,
 }
 
 impl Stream {
@@ -286,6 +288,35 @@ impl Mux {
             self.urgent.push_back(Urgent::Rst(id, code));
         }
         Ok(())
+    }
+
+    /// Stops reading the stream: buffered and later data are discarded and credited back, and
+    /// the stream goes away once FIN has passed both ways. Sending is unaffected.
+    pub fn close_read(&mut self, id: u64) -> Result<(), MuxError> {
+        let s = self
+            .streams
+            .get_mut(&id)
+            .ok_or(MuxError::UnknownStream(id))?;
+        s.read_closed = true;
+        s.unacked += s.recv_buf.len() as u64;
+        s.recv_buf.clear();
+        if s.fin_received {
+            s.fin_delivered = true;
+        } else {
+            Self::credit(&mut self.urgent, id, s);
+        }
+        self.release_slot_if_closed(id);
+        self.remove_if_done(id);
+        Ok(())
+    }
+
+    /// Queues a `WINDOW_UPDATE` once half the window has been consumed.
+    fn credit(urgent: &mut VecDeque<Urgent>, id: u64, s: &mut Stream) {
+        if !s.fin_received && s.unacked >= INITIAL_WINDOW / 2 {
+            s.recv_limit += s.unacked;
+            urgent.push_back(Urgent::WindowUpdate(id, s.unacked));
+            s.unacked = 0;
+        }
     }
 
     /// Reads up to `max` (at least 1) bytes of stream data.
@@ -505,7 +536,11 @@ impl Mux {
                 if s.recv_total > s.recv_limit {
                     return Err(MuxError::Protocol("flow control window exceeded"));
                 }
-                if !payload.is_empty() {
+                if s.read_closed {
+                    // Nobody reads: give the window straight back so the peer is not stalled.
+                    s.unacked += payload.len() as u64;
+                    Self::credit(&mut self.urgent, id, s);
+                } else if !payload.is_empty() {
                     if s.recv_buf.is_empty() {
                         self.events.push_back(Event::Readable(id));
                     }
@@ -517,8 +552,13 @@ impl Mux {
                     return Err(MuxError::Protocol("duplicate FIN"));
                 }
                 s.fin_received = true;
-                self.events.push_back(Event::Readable(id));
+                if s.read_closed {
+                    s.fin_delivered = true;
+                } else {
+                    self.events.push_back(Event::Readable(id));
+                }
                 self.release_slot_if_closed(id);
+                self.remove_if_done(id);
             }
             FrameType::Rst => {
                 let code = ErrorCode(frame::varint_payload(payload, "malformed RST")?);

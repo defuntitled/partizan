@@ -5,6 +5,7 @@
 
 mod config;
 pub mod quic;
+pub mod tcp;
 pub mod tls;
 
 use std::time::Duration;
@@ -36,6 +37,12 @@ pub type RecvHalf = Box<dyn RecvStream>;
 /// Code the peer reset a stream with, from a read or write error on a [`RecvHalf`] /
 /// [`SendHalf`]; `None` for other errors.
 pub fn reset_code(e: &std::io::Error) -> Option<ErrorCode> {
+    if let Some(reset) = e
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<tcp::StreamReset>())
+    {
+        return Some(reset.0);
+    }
     quic::reset_code(e)
 }
 
@@ -97,4 +104,16 @@ pub trait Transport: Send + Sync {
     fn stats(&self) -> TransportStats;
     /// Closes the connection with an application error code.
     fn close(&self, code: ErrorCode, reason: &[u8]);
+    /// Resolves when the connection is gone, with the reason.
+    async fn closed(&self) -> TransportError;
+}
+
+/// The session's control channel: HTTP/3 `DATA` frames on the auth stream (QUIC) or mux
+/// `CONTROL` frames (TCP+TLS).
+#[async_trait]
+pub trait ControlChannel: Send + Sync {
+    /// Sends one encoded control frame.
+    async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError>;
+    /// Next chunk of control-channel bytes; `None` once the channel is closed.
+    async fn recv(&self) -> Option<Vec<u8>>;
 }

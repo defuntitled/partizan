@@ -9,7 +9,7 @@ use proto::{ControlFrame, ErrorCode};
 use tokio::sync::mpsc;
 
 /// One authenticated connection.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Session {
     /// Device it belongs to.
     pub device: DeviceId,
@@ -26,11 +26,11 @@ pub struct Session {
     /// Its control channel.
     pub control: mpsc::Sender<ControlFrame>,
     /// The connection, to close it.
-    pub conn: quinn::Connection,
+    pub connection: std::sync::Arc<dyn transport::Transport>,
 }
 
 /// Session table.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Sessions {
     inner: Mutex<HashMap<u64, Session>>,
 }
@@ -80,13 +80,10 @@ impl Sessions {
                 retry_after_ms,
             });
             if code == ErrorCode::REVOKED {
-                let conn = session.conn.clone();
+                let connection = session.connection.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    conn.close(
-                        quinn::VarInt::from_u64(code.0).unwrap_or(quinn::VarInt::MAX),
-                        b"revoked",
-                    );
+                    connection.close(code, b"revoked");
                 });
             }
         }

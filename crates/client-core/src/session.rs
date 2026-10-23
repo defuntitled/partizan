@@ -9,17 +9,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use proto::auth::{
-    ClientHandshake, ClientInfo, ConnectionUri, DataFrameReader, HANDSHAKE_TIMEOUT, HandshakeError,
-    SessionInfo, Transport as AuthTransport, client_control_stream, encode_data_frame,
+    ClientHandshake, ClientInfo, ConnectionUri, HANDSHAKE_TIMEOUT, HandshakeError, SessionInfo,
+    Transport as AuthTransport, TransportMode, client_control_stream,
 };
 use proto::control::ControlReader;
+use proto::mux::Role;
 use proto::{ControlFrame, ErrorCode, UdpDatagram};
-use quinn::{ConnectionError, Endpoint};
+use quinn::Endpoint;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::AbortHandle;
-use transport::quic::{self, QuicTransport};
-use transport::tls::{self, ALPN_H3, ServerVerification};
-use transport::{QuicConfig, Transport, TransportStats};
+use transport::quic::{self, QuicControl};
+use transport::tcp::{self, MuxTransport};
+use transport::tls::{self, ALPN_H3, ALPN_HTTP11, ServerVerification};
+use transport::{ControlChannel, QuicConfig, Transport, TransportError, TransportStats};
 
 use crate::udp::UdpRegistry;
 
@@ -27,6 +30,8 @@ use crate::udp::UdpRegistry;
 pub const SESSION_WAIT: Duration = Duration::from_secs(5);
 /// QUIC handshake deadline; past it the server counts as unreachable over QUIC.
 pub const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// TCP connect plus TLS handshake deadline.
+const TLS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -98,30 +103,33 @@ enum End {
 
 /// An authenticated connection.
 pub(crate) struct Session {
-    pub(crate) transport: QuicTransport,
+    pub(crate) transport: Arc<dyn Transport>,
     pub(crate) info: SessionInfo,
+    /// `quic` or `tls`.
+    pub(crate) kind: &'static str,
     /// Frames to send on the control channel.
     pub(crate) control: mpsc::Sender<ControlFrame>,
-    endpoint: Endpoint,
+    /// QUIC only: the endpoint, for rebinding.
+    endpoint: Option<Endpoint>,
     /// `GoAway` from the server: code and retry delay.
     go_away: watch::Receiver<Option<(ErrorCode, u64)>>,
-    // Kept open for the session's lifetime.
-    _h3_control: quinn::SendStream,
+    closed: watch::Receiver<bool>,
+    // Kept open for the session's lifetime (QUIC: the HTTP/3 control stream).
+    _h3_control: Option<quinn::SendStream>,
     tasks: Vec<AbortHandle>,
 }
 
 impl Session {
     /// Usable for new streams: open and not told to go away.
     pub(crate) fn is_alive(&self) -> bool {
-        self.transport.connection().close_reason().is_none() && self.go_away.borrow().is_none()
+        !*self.closed.borrow() && self.go_away.borrow().is_none()
     }
 
     async fn ended(&self) -> End {
         let mut go_away = self.go_away.clone();
         tokio::select! {
-            e = self.transport.connection().closed() => match e {
-                ConnectionError::ApplicationClosed(c)
-                    if c.error_code.into_inner() == ErrorCode::REVOKED.0 => End::Revoked,
+            e = self.transport.closed() => match e {
+                TransportError::ClosedByPeer(ErrorCode::REVOKED) => End::Revoked,
                 other => End::Lost(other.to_string()),
             },
             Ok(g) = go_away.wait_for(Option::is_some) => match *g {
@@ -250,16 +258,16 @@ impl Engine {
     /// Moves the QUIC socket to a fresh local port after a WAN address change; connection
     /// migration keeps the session and its calls.
     pub fn rebind(&self) -> Result<(), EngineError> {
-        let Some(session) = self.live() else {
+        let Some(endpoint) = self.live().and_then(|s| s.endpoint.clone()) else {
             return Ok(());
         };
-        let bind: SocketAddr = match session.endpoint.local_addr() {
+        let bind: SocketAddr = match endpoint.local_addr() {
             Ok(SocketAddr::V6(_)) => "[::]:0",
             _ => "0.0.0.0:0",
         }
         .parse()
         .expect("literal address");
-        quic::rebind(&session.endpoint, bind).map_err(|e| EngineError::Connect(e.to_string()))?;
+        quic::rebind(&endpoint, bind).map_err(|e| EngineError::Connect(e.to_string()))?;
         log::info!("rebound the QUIC socket");
         Ok(())
     }
@@ -269,7 +277,7 @@ impl Engine {
         let live = self.live();
         Status {
             connected: live.is_some(),
-            transport: live.as_ref().map(|_| "quic"),
+            transport: live.as_ref().map(|s| s.kind),
             session: live.as_ref().map(|s| s.info),
             stats: live
                 .as_ref()
@@ -350,8 +358,19 @@ fn backoff(failures: u32) -> Duration {
     base.mul_f64(jitter.min(0.999))
 }
 
-/// Resolves the server, connects over QUIC and runs the auth exchange.
+/// Connects over the transport the URI asks for and runs the auth exchange.
 async fn establish(config: &EngineConfig, udp: Arc<UdpRegistry>) -> Result<Session, EngineError> {
+    match config.uri.transport {
+        TransportMode::Tls => establish_tls(config, udp).await,
+        TransportMode::Quic | TransportMode::Auto => establish_quic(config, udp).await,
+    }
+}
+
+/// QUIC with the HTTP/3 auth exchange on the first bidi stream.
+async fn establish_quic(
+    config: &EngineConfig,
+    udp: Arc<UdpRegistry>,
+) -> Result<Session, EngineError> {
     let uri = &config.uri;
     let addr = resolve(&uri.host, uri.port).await?;
     let tls = tls::client_config(ServerVerification::from_uri(uri), &[ALPN_H3])
@@ -398,44 +417,122 @@ async fn establish(config: &EngineConfig, udp: Arc<UdpRegistry>) -> Result<Sessi
     let (established, h3_control, send, recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, auth)
         .await
         .map_err(|_| EngineError::Handshake(HandshakeError::Timeout))??;
-    let info = established.session;
+    log::info!(
+        "session up via QUIC to {addr} in {} ms",
+        started.elapsed().as_millis()
+    );
+    let control = Arc::new(QuicControl::new(send, recv, established.leftover));
+    Ok(start_session(
+        Arc::new(transport),
+        control,
+        established.session,
+        "quic",
+        Some(endpoint),
+        Some(h3_control),
+        udp,
+    ))
+}
+
+/// TCP+TLS with the HTTP/1.1 `Upgrade` exchange, then the mux.
+async fn establish_tls(
+    config: &EngineConfig,
+    udp: Arc<UdpRegistry>,
+) -> Result<Session, EngineError> {
+    let uri = &config.uri;
+    let addr = resolve(&uri.host, uri.port).await?;
+    // Offer what a browser offers; our server picks http/1.1.
+    let tls = tls::client_config(ServerVerification::from_uri(uri), &[b"h2", ALPN_HTTP11])
+        .map_err(|e| EngineError::Connect(e.to_string()))?;
+    let started = Instant::now();
+    let mut stream = tokio::time::timeout(
+        TLS_CONNECT_TIMEOUT,
+        tcp::connect_tls(addr, uri.server_name(), tls),
+    )
+    .await
+    .map_err(|_| EngineError::Connect(format!("TLS connect to {addr} timed out")))?
+    .map_err(|e| EngineError::Connect(e.to_string()))?;
+    if stream.get_ref().1.alpn_protocol() != Some(ALPN_HTTP11) {
+        return Err(EngineError::Connect(
+            "server did not select http/1.1".into(),
+        ));
+    }
+    let auth = async {
+        let (mut handshake, request) =
+            ClientHandshake::start(AuthTransport::Tls, uri, &config.info, Instant::now())?;
+        stream.write_all(&request).await.map_err(io)?;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.map_err(io)?;
+            if n == 0 {
+                return Err(EngineError::Handshake(HandshakeError::Rejected));
+            }
+            if let Some(established) = handshake.handle_input(&buf[..n])? {
+                return Ok(established);
+            }
+        }
+    };
+    let established = tokio::time::timeout(HANDSHAKE_TIMEOUT, auth)
+        .await
+        .map_err(|_| EngineError::Handshake(HandshakeError::Timeout))??;
+    log::info!(
+        "session up via TCP+TLS to {addr} in {} ms",
+        started.elapsed().as_millis()
+    );
+    let mux = MuxTransport::new(stream, Role::Client, &established.leftover);
+    Ok(start_session(
+        Arc::new(mux.clone()),
+        Arc::new(mux),
+        established.session,
+        "tls",
+        None,
+        None,
+        udp,
+    ))
+}
+
+/// Starts the control channel and datagram tasks of a fresh session.
+fn start_session(
+    transport: Arc<dyn Transport>,
+    control_channel: Arc<dyn ControlChannel>,
+    info: SessionInfo,
+    kind: &'static str,
+    endpoint: Option<Endpoint>,
+    h3_control: Option<quinn::SendStream>,
+    udp: Arc<UdpRegistry>,
+) -> Session {
+    log::info!("sid {:x}, caps {:x}", info.sid, info.caps.0);
     let (control, control_rx) = mpsc::channel(64);
     let (go_away_tx, go_away) = watch::channel(None);
+    let (closed_tx, closed) = watch::channel(false);
+    let watcher = transport.clone();
     let tasks = vec![
-        tokio::spawn(write_control(send, control_rx)).abort_handle(),
-        tokio::spawn(read_control(
-            recv,
-            established.leftover,
-            udp.clone(),
-            go_away_tx,
-        ))
-        .abort_handle(),
+        tokio::spawn(write_control(control_channel.clone(), control_rx)).abort_handle(),
+        tokio::spawn(read_control(control_channel, udp.clone(), go_away_tx)).abort_handle(),
         tokio::spawn(read_datagrams(transport.clone(), udp)).abort_handle(),
+        tokio::spawn(async move {
+            watcher.closed().await;
+            closed_tx.send_replace(true);
+        })
+        .abort_handle(),
     ];
-    log::info!(
-        "session up via QUIC to {addr} in {} ms (sid {:x}, caps {:x})",
-        started.elapsed().as_millis(),
-        info.sid,
-        info.caps.0
-    );
-    Ok(Session {
+    Session {
         transport,
         info,
+        kind,
         control,
         endpoint,
         go_away,
+        closed,
         _h3_control: h3_control,
         tasks,
-    })
+    }
 }
 
-/// Sends control frames, each in an HTTP/3 `DATA` frame on the auth stream.
-async fn write_control(mut send: quinn::SendStream, mut frames: mpsc::Receiver<ControlFrame>) {
+/// Sends control frames.
+async fn write_control(channel: Arc<dyn ControlChannel>, mut frames: mpsc::Receiver<ControlFrame>) {
     while let Some(frame) = frames.recv().await {
         let mut body = Vec::new();
-        if frame.encode(&mut body).is_ok()
-            && send.write_all(&encode_data_frame(&body)).await.is_err()
-        {
+        if frame.encode(&mut body).is_ok() && channel.send(body).await.is_err() {
             return;
         }
     }
@@ -443,19 +540,13 @@ async fn write_control(mut send: quinn::SendStream, mut frames: mpsc::Receiver<C
 
 /// Handles the server's control frames.
 async fn read_control(
-    mut recv: quinn::RecvStream,
-    leftover: Vec<u8>,
+    channel: Arc<dyn ControlChannel>,
     udp: Arc<UdpRegistry>,
     go_away: watch::Sender<Option<(ErrorCode, u64)>>,
 ) {
-    let (mut data, mut frames) = (DataFrameReader::default(), ControlReader::default());
-    let mut bytes = leftover;
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let Ok(payload) = data.push(&bytes) else {
-            return;
-        };
-        let Ok(parsed) = frames.push(&payload) else {
+    let mut frames = ControlReader::default();
+    while let Some(bytes) = channel.recv().await {
+        let Ok(parsed) = frames.push(&bytes) else {
             return;
         };
         for frame in parsed {
@@ -474,15 +565,11 @@ async fn read_control(
                 _ => {}
             }
         }
-        match recv.read(&mut buf).await {
-            Ok(Some(n)) => bytes = buf[..n].to_vec(),
-            _ => return,
-        }
     }
 }
 
 /// Hands incoming datagrams to their UDP flows.
-async fn read_datagrams(transport: QuicTransport, udp: Arc<UdpRegistry>) {
+async fn read_datagrams(transport: Arc<dyn Transport>, udp: Arc<UdpRegistry>) {
     while let Ok(raw) = transport.recv_datagram().await {
         match UdpDatagram::decode(raw) {
             Ok(datagram) => udp.deliver(datagram),

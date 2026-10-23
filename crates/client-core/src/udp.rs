@@ -11,7 +11,7 @@ use bytes::Bytes;
 use proto::control::udp_close;
 use proto::{ControlFrame, TargetAddr, UdpDatagram};
 use tokio::sync::mpsc;
-use transport::{DatagramError, Transport};
+use transport::DatagramError;
 
 use crate::session::{Engine, EngineError};
 

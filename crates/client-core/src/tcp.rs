@@ -2,7 +2,7 @@
 
 use proto::{Connect, ConnectResult, ConnectStatus, DecodeError, ErrorCode, TargetAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use transport::{RecvHalf, SendHalf, Transport};
+use transport::{RecvHalf, SendHalf};
 
 use crate::session::{Engine, EngineError};
 

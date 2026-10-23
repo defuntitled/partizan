@@ -637,3 +637,35 @@ fn writable_after_send_buffer_drains() {
     assert!(c.poll_transmit(&mut out));
     assert_eq!(events(&mut c), [Event::Writable(id)]);
 }
+
+#[test]
+fn close_read_discards_and_keeps_the_window_open() {
+    let (mut c, mut s) = pair();
+    let id = c.open_stream().unwrap();
+    c.write(id, b"ignored").unwrap();
+    pump(&mut c, &mut s);
+    s.close_read(id).unwrap();
+    events(&mut s);
+    // More than a window's worth arrives and is credited back without anyone reading.
+    let data = vec![0u8; 3 * INITIAL_WINDOW as usize];
+    let mut sent = 0;
+    for _ in 0..100 {
+        if sent < data.len() {
+            sent += c.write(id, &data[sent..]).unwrap();
+        }
+        pump(&mut c, &mut s);
+    }
+    assert_eq!(sent, data.len(), "sender stalled");
+    assert!(
+        events(&mut s)
+            .iter()
+            .all(|e| !matches!(e, Event::Readable(_)))
+    );
+    // The server still sends and finishes; after both FINs the stream is gone on both sides.
+    s.write(id, b"reply").unwrap();
+    s.finish(id).unwrap();
+    c.finish(id).unwrap();
+    pump(&mut c, &mut s);
+    assert_eq!(read_all(&mut c, id), (b"reply".to_vec(), true));
+    assert_eq!((c.open_streams(), s.open_streams()), (0, 0));
+}

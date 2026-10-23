@@ -202,4 +202,59 @@ impl Transport for QuicTransport {
     fn close(&self, error: ErrorCode, reason: &[u8]) {
         self.conn.close(code(error), reason);
     }
+
+    async fn closed(&self) -> TransportError {
+        map_connection_error(self.conn.closed().await)
+    }
+}
+
+/// Control channel on the auth stream, each frame in an HTTP/3 `DATA` frame.
+pub struct QuicControl {
+    send: tokio::sync::Mutex<quinn::SendStream>,
+    recv: tokio::sync::Mutex<(quinn::RecvStream, proto::auth::DataFrameReader, Vec<u8>)>,
+}
+
+impl QuicControl {
+    /// Wraps the auth stream; `leftover` is what followed the auth response.
+    pub fn new(send: quinn::SendStream, recv: quinn::RecvStream, leftover: Vec<u8>) -> Self {
+        Self {
+            send: tokio::sync::Mutex::new(send),
+            recv: tokio::sync::Mutex::new((
+                recv,
+                proto::auth::DataFrameReader::default(),
+                leftover,
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::ControlChannel for QuicControl {
+    async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError> {
+        let wrapped = proto::auth::encode_data_frame(&frame);
+        self.send
+            .lock()
+            .await
+            .write_all(&wrapped)
+            .await
+            .map_err(|e| TransportError::Lost(e.to_string()))
+    }
+
+    async fn recv(&self) -> Option<Vec<u8>> {
+        let mut guard = self.recv.lock().await;
+        let (recv, frames, leftover) = &mut *guard;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let bytes = if leftover.is_empty() {
+                let n = recv.read(&mut buf).await.ok()??;
+                buf[..n].to_vec()
+            } else {
+                std::mem::take(leftover)
+            };
+            let payload = frames.push(&bytes).ok()?;
+            if !payload.is_empty() {
+                return Some(payload);
+            }
+        }
+    }
 }

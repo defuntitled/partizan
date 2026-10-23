@@ -15,7 +15,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
-use transport::quic::QuicTransport;
 use transport::{DatagramError, Transport};
 
 use crate::State;
@@ -42,7 +41,7 @@ struct Entry {
 
 /// The NAT for one session.
 pub struct UdpNat {
-    transport: QuicTransport,
+    transport: Arc<dyn Transport>,
     state: Arc<State>,
     control: mpsc::Sender<ControlFrame>,
     limits: UdpLimits,
@@ -56,7 +55,7 @@ impl UdpNat {
     /// NAT that answers through `transport` and reports closes on `control`; the session
     /// limit is shared through `device_count` by all connections of the device.
     pub fn new(
-        transport: QuicTransport,
+        transport: Arc<dyn Transport>,
         state: Arc<State>,
         control: mpsc::Sender<ControlFrame>,
         limits: UdpLimits,
