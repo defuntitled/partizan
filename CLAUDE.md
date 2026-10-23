@@ -47,6 +47,10 @@ Every commit must build and pass tests on its own (`git bisect` must work).
 ```
 cargo build --release -p server                          # server, opt-level 3
 cargo build --profile release-client -p client-openwrt   # router client, size-optimized (bin `partizan`)
+# Cross builds need zig on PATH (0.14.1) and cargo-zigbuild:
+cargo zigbuild --profile release-client -p client-openwrt --target aarch64-unknown-linux-musl
+cargo zigbuild --release -p server --target x86_64-unknown-linux-musl
+scripts/check-size.sh target/aarch64-unknown-linux-musl/release-client/partizan 5242880
 ```
 
 Size flags (`lto`, `panic = "abort"`, …) live in the `release-client` profile, not `release`, because Cargo can't set them per package.
