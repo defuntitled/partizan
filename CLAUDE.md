@@ -24,7 +24,6 @@ Every commit must build and pass tests on its own (`git bisect` must work).
 - Test names embed the case ID from the plan: `fn c07_t3_auth_rejects_unknown_device()`. Manual cases are marked «ручной» and their result goes in the commit message.
 - If a commit changes behavior described in the spec, update the spec in the same commit.
 - Public items are documented; no `TODO` without an issue link.
-- Run the agent code review before completing the task once and address its comments.
 
 ## Architectural constraints
 
