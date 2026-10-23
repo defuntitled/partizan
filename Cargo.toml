@@ -15,6 +15,11 @@ client-core = { path = "crates/client-core" }
 socks5 = { path = "crates/socks5" }
 bytes = "1"
 thiserror = "2"
+base64 = "0.22"
+getrandom = "0.3"
+sha2 = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

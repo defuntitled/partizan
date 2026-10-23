@@ -48,8 +48,6 @@ Oct 23, 2026 · @kir
 22. C22 — QUIC клиента на BoringSSL и HTTP/3 как у Chrome
 23. C23 — passthrough: разбор ClientHello и L4-пересылка
 24. C24 — passthrough: метка REALITY и временный сертификат
-25. C25 — e2e-набор и укрепление
-26. C26 — приёмка MVP
 
 ## Этапы 0–1: каркас и ядро proto
 
