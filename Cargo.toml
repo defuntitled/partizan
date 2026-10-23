@@ -22,6 +22,14 @@ sha2 = "0.10"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
+async-trait = "0.1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+webpki-roots = "1"
 
 [workspace.lints.rust]
 missing_docs = "warn"

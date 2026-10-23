@@ -15,6 +15,8 @@ allow = [
     "Unicode-3.0",
 ]
 private = { ignore = true }
+# Mozilla's root store data.
+exceptions = [{ name = "webpki-roots", allow = ["CDLA-Permissive-2.0"] }]
 
 [bans]
 multiple-versions = "warn"
