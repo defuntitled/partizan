@@ -15,6 +15,7 @@ getrandom.workspace = true
 hickory-resolver.workspace = true
 lexopt.workspace = true
 proto.workspace = true
+qrcode.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
@@ -33,4 +34,4 @@ transport.workspace = true
 workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "process"] }

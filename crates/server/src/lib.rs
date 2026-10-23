@@ -2,8 +2,10 @@
 //! authenticates them against the registry and opens their connections from the server's
 //! address.
 
+pub mod admin;
 pub mod bench;
 pub mod config;
+pub mod devices;
 pub mod dial;
 pub mod egress;
 pub mod proxy;
@@ -97,6 +99,7 @@ pub struct State {
     udp_per_device: Mutex<HashMap<auth::DeviceId, Arc<AtomicUsize>>>,
     /// Benchmark UDP echo when `[bench]` is enabled.
     pub(crate) bench_udp: Option<SocketAddr>,
+    sessions_per_device: usize,
 }
 
 impl State {
@@ -129,6 +132,7 @@ impl State {
 
 /// Bound server, ready to [`Server::run`].
 pub struct Server {
+    admin_sock: Option<PathBuf>,
     endpoint: Endpoint,
     tcp: TcpListener,
     acceptor: TlsAcceptor,
@@ -181,6 +185,7 @@ impl Server {
                 dns_idle: config.limits.udp_dns_idle_timeout,
             },
             udp_per_device: Mutex::new(HashMap::new()),
+            sessions_per_device: config.limits.sessions_per_device.max(1) as usize,
             bench_udp: if config.bench.enabled {
                 Some(bench::spawn_udp_echo().await?)
             } else {
@@ -188,6 +193,7 @@ impl Server {
             },
         };
         Ok(Self {
+            admin_sock: config.server.admin_sock.clone(),
             endpoint,
             tcp,
             acceptor,
@@ -218,6 +224,13 @@ impl Server {
 
     /// Serves both listeners until the QUIC endpoint closes.
     pub async fn run(self) {
+        if let (Some(path), Ok(addr)) = (self.admin_sock.clone(), self.endpoint.local_addr()) {
+            let info = admin::Info {
+                pin: self.pin,
+                port: addr.port(),
+            };
+            tokio::spawn(admin::serve(path, self.state.clone(), info));
+        }
         let tcp = {
             let (tcp, acceptor, state) = (self.tcp, self.acceptor, self.state.clone());
             tokio::spawn(async move {
@@ -390,6 +403,13 @@ async fn run_session(
         .unwrap_or_default();
     tracing::info!(device = %accepted.device, name = %name, transport = kind, sid = format_args!("{sid:x}"), "session started");
     let (control_tx, control_rx) = mpsc::channel(64);
+    // Over the limit the oldest session goes: a reconnecting client's previous session may
+    // still be lingering.
+    let keep = state.sessions_per_device.saturating_sub(1);
+    let evicted = state.sessions.evict_oldest(accepted.device, keep);
+    if evicted > 0 {
+        tracing::info!(device = %accepted.device, evicted, "session limit: closed the oldest");
+    }
     state.sessions.insert(
         sid,
         Session {

@@ -90,6 +90,33 @@ impl Sessions {
         targets.len()
     }
 
+    /// Closes the oldest sessions of `device` until at most `keep` remain, with
+    /// `GoAway(SESSION_LIMIT)` first; returns how many were closed.
+    pub fn evict_oldest(&self, device: DeviceId, keep: usize) -> usize {
+        let mut own: Vec<(u64, Session)> = self
+            .lock()
+            .iter()
+            .filter(|(_, s)| s.device == device)
+            .map(|(&sid, s)| (sid, s.clone()))
+            .collect();
+        own.sort_by_key(|(_, s)| s.started);
+        let excess = own.len().saturating_sub(keep);
+        for (sid, session) in own.into_iter().take(excess) {
+            self.lock().remove(&sid);
+            let _ = session.control.try_send(ControlFrame::GoAway {
+                code: ErrorCode::SESSION_LIMIT,
+                retry_after_ms: 0,
+            });
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                session
+                    .connection
+                    .close(ErrorCode::SESSION_LIMIT, b"session limit");
+            });
+        }
+        excess
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Session>> {
         // A panic while holding the lock leaves the map consistent; keep serving.
         self.inner.lock().unwrap_or_else(|e| e.into_inner())

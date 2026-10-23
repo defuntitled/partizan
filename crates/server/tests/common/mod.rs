@@ -125,6 +125,15 @@ pub async fn connect(
     pin: [u8; 32],
     token: [u8; 32],
 ) -> Result<Client, HandshakeError> {
+    connect_uri(addr, pin, &uri(token)).await
+}
+
+/// Connects with the credentials of `uri` (its address is ignored: `addr` is used).
+pub async fn connect_uri(
+    addr: SocketAddr,
+    pin: [u8; 32],
+    uri: &ConnectionUri,
+) -> Result<Client, HandshakeError> {
     let tls = tls::client_config(ServerVerification::Pin(pin), &[ALPN_H3]).unwrap();
     let endpoint =
         quic::client_endpoint("127.0.0.1:0".parse().unwrap(), tls, &QuicConfig::default()).unwrap();
@@ -138,7 +147,7 @@ pub async fn connect(
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     let info = ClientInfo::new("test", "0.1.0");
     let (mut handshake, request) =
-        ClientHandshake::start(AuthTransport::Quic, &uri(token), &info, Instant::now()).unwrap();
+        ClientHandshake::start(AuthTransport::Quic, uri, &info, Instant::now()).unwrap();
     send.write_all(&request).await.unwrap();
     let mut buf = [0u8; 4096];
     loop {

@@ -98,6 +98,11 @@ pub fn format_pin(pin: &[u8; 32]) -> String {
     format!("sha256/{}", base64url(pin))
 }
 
+/// Parses the base64url part of a pin (after `sha256/`).
+pub fn parse_pin_base64(s: &str) -> Option<[u8; 32]> {
+    unbase64url(s)
+}
+
 impl ConnectionUri {
     /// TLS server name: `sni`, else `host`.
     pub fn server_name(&self) -> &str {

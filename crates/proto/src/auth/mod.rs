@@ -21,7 +21,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub use h3::{DataFrameError, DataFrameReader, client_control_stream, encode_data_frame};
 pub use secret::{DeviceId, Token, TokenHash};
-pub use uri::{ConnectionUri, Passthrough, TransportMode, UriError, format_pin};
+pub use uri::{ConnectionUri, Passthrough, TransportMode, UriError, format_pin, parse_pin_base64};
 
 /// Protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;

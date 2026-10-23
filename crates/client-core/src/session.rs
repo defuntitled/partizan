@@ -142,6 +142,8 @@ impl Session {
             Ok(g) = go_away.wait_for(Option::is_some) => match *g {
                 Some((ErrorCode::REVOKED, _)) => End::Revoked,
                 Some((ErrorCode::IDLE_TIMEOUT, _)) => End::Idle,
+                // Evicted for a newer session of the same device: back off, do not fight it.
+                Some((ErrorCode::SESSION_LIMIT, _)) => End::Lost("session limit".into()),
                 Some((_, ms)) => End::Shutdown(Duration::from_millis(ms).min(RETRY_AFTER_MAX)),
                 None => End::Lost("go away".into()),
             },

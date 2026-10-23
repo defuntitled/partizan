@@ -6,36 +6,62 @@ use std::process::ExitCode;
 use server::Server;
 use server::config::Config;
 
-const USAGE: &str = "usage: partizan-server run [--config PATH]\n       partizan-server version";
+mod cli;
+
+const USAGE: &str = "\
+usage: partizan-server run [--config PATH]
+       partizan-server device add NAME [--host HOST] [--config PATH]
+       partizan-server device rotate ID|NAME [--host HOST] [--config PATH]
+       partizan-server device revoke ID|NAME [--config PATH]
+       partizan-server device list [--config PATH]
+       partizan-server session list [--config PATH]
+       partizan-server version";
 const DEFAULT_CONFIG: &str = "/etc/partizan/server.toml";
 
 enum Command {
-    Run { config: PathBuf },
+    Run {
+        config: PathBuf,
+    },
+    Admin {
+        config: PathBuf,
+        action: cli::Action,
+    },
     Version,
 }
 
-fn parse_args() -> Result<Command, lexopt::Error> {
+fn parse_args() -> Result<Command, String> {
     use lexopt::prelude::*;
+    let fail = |e: lexopt::Error| e.to_string();
     let mut parser = lexopt::Parser::from_env();
-    let command = match parser.next()? {
-        Some(Value(cmd)) => cmd.string()?,
-        Some(Long("help") | Short('h')) | None => return Err(lexopt::Error::from(USAGE)),
-        Some(arg) => return Err(arg.unexpected()),
-    };
-    match command.as_str() {
-        "run" => {
-            let mut config = PathBuf::from(DEFAULT_CONFIG);
-            while let Some(arg) = parser.next()? {
-                match arg {
-                    Long("config") | Short('c') => config = parser.value()?.into(),
-                    _ => return Err(arg.unexpected()),
-                }
-            }
-            Ok(Command::Run { config })
+    let mut words = Vec::new();
+    let (mut config, mut host) = (PathBuf::from(DEFAULT_CONFIG), None);
+    while let Some(arg) = parser.next().map_err(fail)? {
+        match arg {
+            Long("config") | Short('c') => config = parser.value().map_err(fail)?.into(),
+            Long("host") => host = Some(parser.value().map_err(fail)?.string().map_err(fail)?),
+            Long("help") | Short('h') => return Err(USAGE.into()),
+            Value(word) => words.push(word.string().map_err(fail)?),
+            _ => return Err(format!("{}\n{USAGE}", fail(arg.unexpected()))),
         }
-        "version" => Ok(Command::Version),
-        other => Err(format!("unknown command {other:?}\n{USAGE}").into()),
     }
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let action = match words.as_slice() {
+        ["run"] => return Ok(Command::Run { config }),
+        ["version"] => return Ok(Command::Version),
+        ["device", "add", name] => cli::Action::Add {
+            name: (*name).into(),
+            host,
+        },
+        ["device", "rotate", key] => cli::Action::Rotate {
+            key: (*key).into(),
+            host,
+        },
+        ["device", "revoke", key] => cli::Action::Revoke { key: (*key).into() },
+        ["device", "list"] => cli::Action::List,
+        ["session", "list"] => cli::Action::Sessions,
+        _ => return Err(USAGE.into()),
+    };
+    Ok(Command::Admin { config, action })
 }
 
 fn main() -> ExitCode {
@@ -56,6 +82,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Run { config } => run(config),
+        Command::Admin { config, action } => match cli::run(&config, action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
