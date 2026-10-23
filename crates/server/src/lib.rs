@@ -4,10 +4,12 @@
 
 pub mod admin;
 pub mod bench;
+pub mod certs;
 pub mod config;
 pub mod devices;
 pub mod dial;
 pub mod egress;
+pub mod masquerade;
 pub mod proxy;
 pub mod registry;
 pub mod sessions;
@@ -42,7 +44,7 @@ use transport::tcp::MuxTransport;
 use transport::tls::{self, ALPN_H3, ALPN_HTTP11};
 use transport::{ControlChannel, Transport};
 
-use crate::config::{Config, TlsMode};
+use crate::config::{Config, MasqueradeMode, TlsMode};
 use crate::egress::EgressPolicy;
 use crate::registry::Registry;
 use crate::sessions::{Session, Sessions};
@@ -100,6 +102,10 @@ pub struct State {
     /// Benchmark UDP echo when `[bench]` is enabled.
     pub(crate) bench_udp: Option<SocketAddr>,
     sessions_per_device: usize,
+    /// The masquerade site.
+    pub site: masquerade::Site,
+    /// The certificate in use.
+    pub certs: Arc<certs::CertStore>,
 }
 
 impl State {
@@ -143,13 +149,29 @@ pub struct Server {
 impl Server {
     /// Loads certificates and the registry and binds UDP.
     pub async fn bind(config: Config) -> Result<Self, ServerError> {
+        if config.masquerade.mode == MasqueradeMode::Passthrough {
+            return Err(ServerError::Config(
+                "masquerade.mode = passthrough is not available yet".into(),
+            ));
+        }
         let (chain, key) = load_certificate(&config)?;
-        let pin = tls::spki_pin(&chain[0])
+        let source = match (config.tls.mode, &config.tls.cert, &config.tls.key) {
+            (TlsMode::Files, Some(cert), Some(key)) => certs::Source::Files {
+                cert: cert.clone(),
+                key: key.clone(),
+            },
+            _ => certs::Source::Fixed,
+        };
+        let certs =
+            Arc::new(certs::CertStore::new(source, chain, key).map_err(ServerError::Config)?);
+        let pin = certs
+            .pin()
             .ok_or_else(|| ServerError::Config("certificate without SPKI".into()))?;
         let bad_tls = |e: rustls::Error| ServerError::Config(e.to_string());
         let quic_tls =
-            tls::server_config(chain.clone(), key.clone_key(), &[ALPN_H3]).map_err(bad_tls)?;
-        let tcp_tls = tls::server_config(chain, key, &[ALPN_HTTP11]).map_err(bad_tls)?;
+            tls::server_config_with_resolver(certs.clone(), &[ALPN_H3]).map_err(bad_tls)?;
+        let tcp_tls =
+            tls::server_config_with_resolver(certs.clone(), &[ALPN_HTTP11]).map_err(bad_tls)?;
         let endpoint = quic::server_endpoint(config.server.listen, quic_tls, &config.quic)?;
         // TCP on the same port as UDP, also when the config asked for port 0.
         let mut tcp_addr = config.server.listen;
@@ -186,6 +208,11 @@ impl Server {
             },
             udp_per_device: Mutex::new(HashMap::new()),
             sessions_per_device: config.limits.sessions_per_device.max(1) as usize,
+            site: masquerade::Site::new(
+                config.masquerade.dir.clone(),
+                endpoint.local_addr()?.port(),
+            ),
+            certs: certs.clone(),
             bench_udp: if config.bench.enabled {
                 Some(bench::spawn_udp_echo().await?)
             } else {
@@ -224,6 +251,21 @@ impl Server {
 
     /// Serves both listeners until the QUIC endpoint closes.
     pub async fn run(self) {
+        // Renewed certificate files are picked up within the hour even without SIGHUP.
+        let certs = self.state.certs.clone();
+        let reloader = tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                every.tick().await;
+                match certs.reload() {
+                    Ok(true) => tracing::info!("certificate reloaded"),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!("certificate reload failed, keeping the old one: {e}")
+                    }
+                }
+            }
+        });
         if let (Some(path), Ok(addr)) = (self.admin_sock.clone(), self.endpoint.local_addr()) {
             let info = admin::Info {
                 pin: self.pin,
@@ -256,6 +298,7 @@ impl Server {
             });
         }
         tcp.abort();
+        reloader.abort();
     }
 }
 
@@ -315,13 +358,17 @@ async fn handle_quic(incoming: Incoming, state: Arc<State>) -> Result<(), String
             );
         }
     });
-    let authed = tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate_quic(&conn, &state)).await;
-    let Ok(Some((accepted, send, recv))) = authed else {
-        // Like a web server after a 404: let the response reach the client and leave closing
-        // to it, within the handshake timeout.
-        let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.closed()).await;
-        conn.close(0u32.into(), b"");
-        return Err("not authenticated".into());
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, first_stream(&conn, &state)).await;
+    let (accepted, send, recv) = match first {
+        Ok(Some(FirstStream::Session(accepted, send, recv))) => (accepted, send, recv),
+        Ok(Some(FirstStream::Visitor(send, request))) => {
+            masquerade::serve_h3(conn, (send, request), state.site.clone()).await;
+            return Err("visitor".into());
+        }
+        _ => {
+            conn.close(0u32.into(), b"");
+            return Err("not HTTP/3".into());
+        }
     };
     let transport: Arc<dyn Transport> = Arc::new(QuicTransport::new(conn));
     let control = Arc::new(QuicControl::new(send, recv, Vec::new()));
@@ -354,26 +401,25 @@ async fn handle_tcp(
             }
             buf.extend_from_slice(&chunk[..n]);
         };
-        Ok((tls, request, buf.split_off(used)))
+        Ok((tls, request, buf, used))
     };
-    let (mut tls, request, leftover) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+    let (mut tls, request, mut buf, used) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
         .await
         .map_err(|_| "auth timed out".to_owned())??;
     match request.and_then(|r| check(&r, &state)) {
         Ok(accepted) => {
             let response = auth::accept_response(AuthTransport::Tls, &accepted.session);
             tls.write_all(&response).await.map_err(|e| e.to_string())?;
+            let leftover = buf.split_off(used);
             let mux = MuxTransport::new(tls, Role::Server, &leftover);
             let transport: Arc<dyn Transport> = Arc::new(mux.clone());
             run_session(state, accepted, "tls", transport, Arc::new(mux)).await;
             Ok(())
         }
         Err(failure) => {
-            tracing::info!(reason = %failure, remote = %peer, "auth rejected (tcp)");
-            let _ = tls
-                .write_all(&auth::not_found_response(AuthTransport::Tls))
-                .await;
-            let _ = tls.shutdown().await;
+            tracing::debug!(reason = %failure, remote = %peer, "not an auth request (tcp)");
+            // Same site as for any visitor, from the very request that failed.
+            masquerade::serve_http1(tls, buf, &state.site).await;
             Err("not authenticated".into())
         }
     }
@@ -491,11 +537,15 @@ async fn read_control(
     }
 }
 
-/// Reads the auth request from the first bidi stream; answers success or `404`.
-async fn authenticate_quic(
-    conn: &quinn::Connection,
-    state: &State,
-) -> Option<(auth::Accepted, quinn::SendStream, quinn::RecvStream)> {
+/// What the first request stream of a QUIC connection turned out to be.
+enum FirstStream {
+    Session(auth::Accepted, quinn::SendStream, quinn::RecvStream),
+    Visitor(quinn::SendStream, auth::web::WebRequest),
+}
+
+/// Reads the first bidi stream: a valid auth request answered with success, or anything
+/// HTTP/3 left to the masquerade site.
+async fn first_stream(conn: &quinn::Connection, state: &State) -> Option<FirstStream> {
     let (mut send, mut recv) = conn.accept_bi().await.ok()?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
@@ -512,15 +562,12 @@ async fn authenticate_quic(
         Ok(accepted) => {
             let response = auth::accept_response(AuthTransport::Quic, &accepted.session);
             send.write_all(&response).await.ok()?;
-            Some((accepted, send, recv))
+            Some(FirstStream::Session(accepted, send, recv))
         }
         Err(failure) => {
-            tracing::info!(reason = %failure, remote = %conn.remote_address(), "auth rejected");
-            let _ = send
-                .write_all(&auth::not_found_response(AuthTransport::Quic))
-                .await;
-            let _ = send.finish();
-            None
+            tracing::debug!(reason = %failure, remote = %conn.remote_address(), "not an auth request");
+            let (web, _) = auth::web::parse_h3(&buf).ok()??;
+            Some(FirstStream::Visitor(send, web))
         }
     }
 }

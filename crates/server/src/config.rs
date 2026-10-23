@@ -32,6 +32,34 @@ pub struct Config {
     /// `[bench]`.
     #[serde(default)]
     pub bench: BenchSection,
+    /// `[masquerade]`.
+    #[serde(default)]
+    pub masquerade: MasqueradeSection,
+}
+
+/// What visitors without a valid token get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MasqueradeMode {
+    /// The server answers as a static site of its own (needs a domain and certificate).
+    #[default]
+    Static,
+    /// Connections without a mark in ClientHello are forwarded to a real site (`sni`).
+    Passthrough,
+}
+
+/// `[masquerade]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MasqueradeSection {
+    /// Mode.
+    pub mode: MasqueradeMode,
+    /// `static`: directory with the site; a placeholder page without one.
+    pub dir: Option<PathBuf>,
+    /// `passthrough`: the real site connections go to.
+    pub sni: Option<String>,
+    /// `passthrough`: static X25519 private key for the marks.
+    pub key: Option<PathBuf>,
 }
 
 /// `[bench]`: endpoints for `partizan bench`; off by default.

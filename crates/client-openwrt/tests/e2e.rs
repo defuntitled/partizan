@@ -69,6 +69,7 @@ async fn start_server_with(token: [u8; 32], transport: TransportMode) -> PathBuf
             attempts: 1,
         },
         bench: server::config::BenchSection { enabled: true },
+        masquerade: Default::default(),
     };
     let server = Server::bind(config).await.unwrap();
     let addr = server.local_addr().unwrap();

@@ -140,6 +140,13 @@ fn run(path: PathBuf) -> ExitCode {
                     Ok(n) => tracing::info!(devices = n, "registry reloaded"),
                     Err(e) => tracing::error!("registry reload failed, keeping the old one: {e}"),
                 }
+                match state.certs.reload() {
+                    Ok(true) => tracing::info!("certificate reloaded"),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!("certificate reload failed, keeping the old one: {e}")
+                    }
+                }
             }
         });
         tokio::select! {

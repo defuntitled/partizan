@@ -96,6 +96,20 @@ pub fn server_config(
     Ok(config)
 }
 
+/// Server config taking its certificate from `resolver`, so it can change at runtime.
+pub fn server_config_with_resolver(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    alpn: &[&[u8]],
+) -> Result<rustls::ServerConfig, Error> {
+    let mut config = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config.max_early_data_size = 0;
+    Ok(config)
+}
+
 /// Accepts a certificate whose SPKI matches the pin (or any, without one) but always checks
 /// the handshake signature, so the server must hold the key.
 #[derive(Debug)]

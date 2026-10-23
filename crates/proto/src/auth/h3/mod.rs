@@ -44,6 +44,19 @@ pub(crate) fn encode_request(
     headers_frame(&fields)
 }
 
+pub(crate) fn encode_method_request(
+    method: &str,
+    authority: &str,
+    path: &str,
+) -> Zeroizing<Vec<u8>> {
+    headers_frame(&[
+        (":method", method),
+        (":authority", authority),
+        (":scheme", "https"),
+        (":path", path),
+    ])
+}
+
 pub(crate) fn encode_response(status: u16, extra: &[(&str, &str)]) -> Zeroizing<Vec<u8>> {
     let status = status.to_string();
     let mut fields = vec![(":status", status.as_str())];

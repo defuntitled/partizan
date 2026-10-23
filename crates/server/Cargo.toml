@@ -34,4 +34,5 @@ transport.workspace = true
 workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "process"] }

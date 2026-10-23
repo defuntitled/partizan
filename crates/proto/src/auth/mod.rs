@@ -11,6 +11,7 @@ mod secret;
 #[cfg(test)]
 mod tests;
 mod uri;
+pub mod web;
 
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
