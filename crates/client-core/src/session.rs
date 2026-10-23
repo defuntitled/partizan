@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::AbortHandle;
 use transport::quic::{self, QuicControl};
-use transport::tcp::{self, MuxTransport};
+use transport::tcp::MuxTransport;
 use transport::tls::{self, ALPN_H3, ALPN_HTTP11, ServerVerification};
 use transport::{ControlChannel, QuicConfig, Transport, TransportError, TransportStats};
 
@@ -548,18 +548,16 @@ async fn establish_tls(
 ) -> Result<Session, EngineError> {
     let uri = &config.uri;
     let addr = resolve(&uri.host, uri.port).await?;
-    // Offer what a browser offers; our server picks http/1.1.
-    let tls = tls::client_config(ServerVerification::from_uri(uri), &[b"h2", ALPN_HTTP11])
-        .map_err(|e| EngineError::Connect(e.to_string()))?;
+    // Chrome's ClientHello on BoringSSL; it offers h2 and http/1.1, our server picks http/1.1.
     let started = Instant::now();
     let mut stream = tokio::time::timeout(
         TLS_CONNECT_TIMEOUT,
-        tcp::connect_tls(addr, uri.server_name(), tls),
+        transport::chrome::connect(addr, uri.server_name(), ServerVerification::from_uri(uri)),
     )
     .await
     .map_err(|_| EngineError::Connect(format!("TLS connect to {addr} timed out")))?
     .map_err(|e| EngineError::Connect(e.to_string()))?;
-    if stream.get_ref().1.alpn_protocol() != Some(ALPN_HTTP11) {
+    if stream.ssl().selected_alpn_protocol() != Some(ALPN_HTTP11) {
         return Err(EngineError::Connect(
             "server did not select http/1.1".into(),
         ));

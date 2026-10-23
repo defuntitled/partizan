@@ -13,7 +13,7 @@ proto.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-transport.workspace = true
+transport = { workspace = true, features = ["chrome"] }
 
 [lints]
 workspace = true

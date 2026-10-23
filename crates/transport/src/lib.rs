@@ -3,6 +3,8 @@
 //! Streams carry proxied TCP connections, datagrams carry UDP. Datagram sends never block:
 //! under pressure they are dropped.
 
+#[cfg(feature = "chrome")]
+pub mod chrome;
 mod config;
 pub mod quic;
 pub mod tcp;

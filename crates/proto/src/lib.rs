@@ -16,6 +16,7 @@ pub mod control;
 mod error;
 pub mod mux;
 mod reader;
+pub mod tls_hello;
 pub mod udp;
 pub mod varint;
 

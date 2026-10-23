@@ -53,6 +53,8 @@ cargo zigbuild --release -p server --target x86_64-unknown-linux-musl
 scripts/check-size.sh target/aarch64-unknown-linux-musl/release-client/partizan 5242880
 ```
 
+The client's TCP+TLS runs on BoringSSL (`transport` feature `chrome`, pulled in by `client-core`): building needs cmake, a C/C++ compiler and libclang. If bindgen cannot find `stddef.h`, set `LIBCLANG_PATH` and `BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/<ver>/include`; cross builds also need `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl` pointing at zig's musl headers (see the CI `cross` job). The Chrome profile and its expected JA4 live in `crates/transport/src/chrome.rs`; the JA4 test fails when they drift.
+
 Size flags (`lto`, `panic = "abort"`, …) live in the `release-client` profile, not `release`, because Cargo can't set them per package.
 
 Toolchain pinned in `rust-toolchain.toml`. Targets: `aarch64-unknown-linux-musl` (router, Routerich AX3000 / OpenWrt 24.10 `mediatek/filogic`) and `x86_64-unknown-linux-musl` (server), cross-built with `cargo-zigbuild`.
