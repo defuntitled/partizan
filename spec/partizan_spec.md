@@ -205,7 +205,7 @@ ConnectResult (сервер → клиент) {
 }
 ```
 
-- **Fast open** (capability `FAST_OPEN`): клиент шлёт данные сразу после `Connect`, не дожидаясь `ConnectResult`. Это экономит один RTT на каждом соединении. Если цель недоступна, сервер возвращает ошибку и сбрасывает stream.
+- **Fast open** (capability `FAST_OPEN`): клиент шлёт данные сразу после `Connect`, не дожидаясь `ConnectResult`. Это экономит один RTT на каждом соединении. Если цель недоступна, сервер сбрасывает stream (`RESET_STREAM` и `STOP_SENDING`) с кодом из таблицы ошибок; `ConnectResult` уходит только при успехе, первым на stream.
 - **Закрытие:** FIN stream = `shutdown(Write)` на другой стороне (полузакрытие работает). RST на любой стороне = `RESET_STREAM` с кодом из таблицы ошибок.
 - Адрес остаётся доменным именем, если так пришёл из SOCKS5, и резолвится на сервере (F5).
 - Домен — от 1 до 255 байт в UTF-8, иначе адрес невалиден. `padding_len` не больше 1024: больший отвергается до ожидания самих байт паддинга.
@@ -353,7 +353,7 @@ MuxFrame {
 | --- | --- |
 | Listeners | QUIC-endpoint на UDP/443 и TLS-acceptor на TCP/443, общий `rustls::ServerConfig` |
 | Auth | Разбор auth-запроса, проверка токена и лимитов, выдача `x-session` |
-| Реестр устройств | `devices.toml` с hot reload по SIGHUP и через admin-сокет |
+| Реестр устройств | `devices.toml` с hot reload по SIGHUP и через admin-сокет; записи `[[device]]` с `id`, `name`, `token_sha256`, `revoked`. Битый файл при reload не применяется, остаётся старый реестр |
 | Менеджер сессий | `session_id → device`, счётчики, рассылка `GoAway` |
 | TCP dialer | Резолв, Happy Eyeballs (RFC 8305), connect, двунаправленное копирование |
 | UDP NAT | Свой UDP-сокет на каждую UDP-сессию, full-cone, таймауты |

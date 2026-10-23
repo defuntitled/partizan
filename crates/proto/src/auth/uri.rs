@@ -93,6 +93,11 @@ impl fmt::Debug for ConnectionUri {
     }
 }
 
+/// Pin as written in a URI and in logs: `sha256/<base64url>`.
+pub fn format_pin(pin: &[u8; 32]) -> String {
+    format!("sha256/{}", base64url(pin))
+}
+
 impl ConnectionUri {
     /// TLS server name: `sni`, else `host`.
     pub fn server_name(&self) -> &str {
@@ -148,7 +153,7 @@ impl ConnectionUri {
             let _ = write!(s, "&sni={sni}");
         }
         if let Some(pin) = &self.pin {
-            let _ = write!(s, "&pin=sha256/{}", base64url(pin));
+            let _ = write!(s, "&pin={}", format_pin(pin));
         }
         if self.transport != TransportMode::Auto {
             let _ = write!(s, "&transport={}", self.transport.as_str());

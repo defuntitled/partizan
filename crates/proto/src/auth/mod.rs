@@ -21,7 +21,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub use h3::client_control_stream;
 pub use secret::{DeviceId, Token, TokenHash};
-pub use uri::{ConnectionUri, Passthrough, TransportMode, UriError};
+pub use uri::{ConnectionUri, Passthrough, TransportMode, UriError, format_pin};
 
 /// Protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -429,6 +429,15 @@ pub fn accept_response(transport: Transport, session: &SessionInfo) -> Vec<u8> {
     match transport {
         Transport::Quic => h3::encode_response(200, &fields).to_vec(),
         Transport::Tls => http1::encode_switching_protocols(&fields),
+    }
+}
+
+/// Plain `404 Not Found` for a rejected request; stands in until the masquerade site answers
+/// instead.
+pub fn not_found_response(transport: Transport) -> Vec<u8> {
+    match transport {
+        Transport::Quic => h3::encode_response(404, &[("content-length", "0")]).to_vec(),
+        Transport::Tls => b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_vec(),
     }
 }
 
