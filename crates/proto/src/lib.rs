@@ -5,6 +5,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod addr;
+pub mod connect;
+mod error;
+mod reader;
+pub mod varint;
+
+pub use addr::{Host, TargetAddr};
+pub use connect::{Connect, ConnectResult, ConnectStatus};
+pub use error::{DecodeError, EncodeError};
+
 #[cfg(test)]
 mod tests {
     #[test]
