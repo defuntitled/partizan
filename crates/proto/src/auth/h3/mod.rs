@@ -103,6 +103,61 @@ pub(crate) fn decode_headers(buf: &[u8]) -> Result<Option<(Fields, usize)>, Pars
     }
 }
 
+/// Wraps control-channel bytes in an HTTP/3 `DATA` frame.
+pub fn encode_data_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 16);
+    frame(FRAME_DATA, payload, &mut out);
+    out
+}
+
+/// Largest `DATA` frame accepted on the control stream.
+const MAX_DATA_FRAME: usize = 64 * 1024;
+
+/// Unwraps the control channel from the HTTP/3 `DATA` frames that follow the response
+/// `HEADERS`. Unknown frame types are skipped; anything else is an error.
+#[derive(Debug, Default)]
+pub struct DataFrameReader {
+    buf: Vec<u8>,
+}
+
+impl DataFrameReader {
+    /// Feeds stream bytes; returns the payload of every `DATA` frame completed by them.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, DataFrameError> {
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut pos = 0;
+        loop {
+            let mut header = pos;
+            let (Some(ty), Some(len)) = (
+                read_varint(&self.buf, &mut header),
+                read_varint(&self.buf, &mut header),
+            ) else {
+                break;
+            };
+            let len = usize::try_from(len)
+                .ok()
+                .filter(|&len| len <= MAX_DATA_FRAME)
+                .ok_or(DataFrameError)?;
+            let Some(payload) = self.buf.get(header..header + len) else {
+                break;
+            };
+            match ty {
+                FRAME_DATA => out.extend_from_slice(payload),
+                FRAME_HEADERS | FRAME_SETTINGS | 0x02..=0x09 | 0x0d => return Err(DataFrameError),
+                _ => {}
+            }
+            pos = header + len;
+        }
+        self.buf.drain(..pos);
+        Ok(out)
+    }
+}
+
+/// The control stream carried something other than `DATA` frames, or an oversized one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("bad HTTP/3 framing on the control stream")]
+pub struct DataFrameError;
+
 /// QUIC varint as RFC 9000 allows it, non-minimal encodings included: unlike our own frames,
 /// HTTP/3 comes from third-party stacks. `None` means more bytes are needed.
 fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
@@ -201,6 +256,27 @@ mod tests {
             decode_headers(&[0xff; MAX_HEAD]).err(),
             Some(ParseError::TooLarge)
         );
+    }
+
+    #[test]
+    fn data_frames_unwrap_across_reads() {
+        let mut wire = encode_data_frame(b"ping");
+        wire.extend_from_slice(&[0x21, 0x01, 0xaa]); // Grease frame, skipped.
+        wire.extend(encode_data_frame(b"pong"));
+        let mut reader = DataFrameReader::default();
+        let mut got = Vec::new();
+        for byte in &wire {
+            got.extend(reader.push(&[*byte]).unwrap());
+        }
+        assert_eq!(got, b"pingpong");
+        assert_eq!(
+            DataFrameReader::default().push(&encode_response(200, &[])),
+            Err(DataFrameError)
+        );
+        let mut huge = Vec::new();
+        put_varint(FRAME_DATA, &mut huge);
+        put_varint(MAX_DATA_FRAME as u64 + 1, &mut huge);
+        assert_eq!(DataFrameReader::default().push(&huge), Err(DataFrameError));
     }
 
     #[test]

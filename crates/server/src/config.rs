@@ -84,6 +84,9 @@ pub struct Limits {
     /// UDP session idle timeout.
     #[serde(deserialize_with = "duration")]
     pub udp_idle_timeout: Duration,
+    /// Idle timeout for UDP sessions to port 53: DNS answers once.
+    #[serde(deserialize_with = "duration")]
+    pub udp_dns_idle_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -92,6 +95,7 @@ impl Default for Limits {
             sessions_per_device: 2,
             udp_sessions_per_device: 512,
             udp_idle_timeout: Duration::from_secs(60),
+            udp_dns_idle_timeout: Duration::from_secs(10),
         }
     }
 }

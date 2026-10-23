@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use zeroize::{Zeroize, Zeroizing};
 
-pub use h3::client_control_stream;
+pub use h3::{DataFrameError, DataFrameReader, client_control_stream, encode_data_frame};
 pub use secret::{DeviceId, Token, TokenHash};
 pub use uri::{ConnectionUri, Passthrough, TransportMode, UriError, format_pin};
 

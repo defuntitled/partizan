@@ -53,23 +53,7 @@ pub async fn dial(
     resolver: &TokioResolver,
     egress: &EgressPolicy,
 ) -> Result<TcpStream, DialError> {
-    let ips: Vec<IpAddr> = match &target.host {
-        Host::V4(ip) => vec![IpAddr::V4(*ip)],
-        Host::V6(ip) => vec![IpAddr::V6(*ip)],
-        Host::Domain(name) => {
-            // A trailing dot keeps resolv.conf search domains out of it.
-            let fqdn = if name.ends_with('.') {
-                name.clone()
-            } else {
-                format!("{name}.")
-            };
-            let lookup = resolver
-                .lookup_ip(fqdn)
-                .await
-                .map_err(|_| DialError::Unreachable)?;
-            lookup.iter().collect()
-        }
-    };
+    let ips = resolve(&target.host, resolver).await?;
     let allowed: Vec<SocketAddr> = ips
         .iter()
         .filter(|ip| egress.allows(**ip))
@@ -95,6 +79,30 @@ pub async fn dial(
         .with_interval(Duration::from_secs(15));
     SockRef::from(&stream).set_tcp_keepalive(&keepalive).ok();
     Ok(stream)
+}
+
+/// Addresses for `host`, resolved on the server; literals pass through.
+pub async fn resolve(
+    target_host: &Host,
+    resolver: &TokioResolver,
+) -> Result<Vec<IpAddr>, DialError> {
+    Ok(match target_host {
+        Host::V4(ip) => vec![IpAddr::V4(*ip)],
+        Host::V6(ip) => vec![IpAddr::V6(*ip)],
+        Host::Domain(name) => {
+            // A trailing dot keeps resolv.conf search domains out of it.
+            let fqdn = if name.ends_with('.') {
+                name.clone()
+            } else {
+                format!("{name}.")
+            };
+            let lookup = resolver
+                .lookup_ip(fqdn)
+                .await
+                .map_err(|_| DialError::Unreachable)?;
+            lookup.iter().collect()
+        }
+    })
 }
 
 /// IPv6 and IPv4 alternating, IPv6 first (RFC 8305 §4).

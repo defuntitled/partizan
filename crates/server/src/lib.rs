@@ -7,21 +7,29 @@ pub mod egress;
 pub mod proxy;
 pub mod registry;
 pub mod sessions;
+pub mod udp;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{LookupIpStrategy, ResolveHosts};
+use proto::ControlFrame;
 use proto::auth::{
-    self, AuthRequest, Caps, HANDSHAKE_TIMEOUT, ServerPolicy, Transport as AuthTransport,
+    self, AuthRequest, Caps, DataFrameReader, HANDSHAKE_TIMEOUT, ServerPolicy,
+    Transport as AuthTransport, encode_data_frame,
 };
+use proto::control::ControlReader;
 use quinn::{Endpoint, Incoming};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::sync::mpsc;
 use transport::Transport;
 use transport::quic::{self, QuicTransport};
 use transport::tls::{self, ALPN_H3};
@@ -30,6 +38,7 @@ use crate::config::{Config, TlsMode};
 use crate::egress::EgressPolicy;
 use crate::registry::Registry;
 use crate::sessions::{Session, Sessions};
+use crate::udp::{UdpLimits, UdpNat};
 
 /// Largest UDP datagram payload we tell clients to send.
 const UDP_MAX: u32 = 1200;
@@ -45,6 +54,24 @@ pub enum ServerError {
     Io(#[from] io::Error),
 }
 
+/// Counters exported as metrics.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    /// UDP replies larger than the client's datagram limit.
+    pub udp_oversize_drops: AtomicU64,
+    /// Undecodable datagrams, or a new UDP session without a destination.
+    pub udp_malformed_drops: AtomicU64,
+    /// Datagrams to destinations the egress policy refuses.
+    pub udp_denied_drops: AtomicU64,
+}
+
+impl Metrics {
+    /// Current value of a counter.
+    pub fn get(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+}
+
 /// Shared state for all connections.
 pub struct State {
     registry: RwLock<Arc<Registry>>,
@@ -56,6 +83,10 @@ pub struct State {
     pub resolver: TokioResolver,
     /// Live sessions.
     pub sessions: Sessions,
+    /// Counters.
+    pub metrics: Metrics,
+    udp: UdpLimits,
+    udp_per_device: Mutex<HashMap<auth::DeviceId, Arc<AtomicUsize>>>,
 }
 
 impl State {
@@ -65,6 +96,16 @@ impl State {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Shared UDP session counter of a device.
+    fn udp_counter(&self, device: auth::DeviceId) -> Arc<AtomicUsize> {
+        let mut map = self
+            .udp_per_device
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, c| Arc::strong_count(c) > 1 || c.load(Ordering::Relaxed) > 0);
+        map.entry(device).or_default().clone()
     }
 
     /// Re-reads the registry file; on error the old registry stays.
@@ -108,12 +149,19 @@ impl Server {
             devices_path: config.server.devices,
             policy: ServerPolicy {
                 auth_path: config.server.auth_path,
-                caps: Caps::FAST_OPEN | Caps::PADDING,
+                caps: Caps::ALL,
                 udp_max: UDP_MAX,
             },
             egress: EgressPolicy::new(config.egress.deny_private, config.egress.allow),
             resolver,
             sessions: Sessions::default(),
+            metrics: Metrics::default(),
+            udp: UdpLimits {
+                max_sessions: config.limits.udp_sessions_per_device as usize,
+                idle: config.limits.udp_idle_timeout,
+                dns_idle: config.limits.udp_dns_idle_timeout,
+            },
+            udp_per_device: Mutex::new(HashMap::new()),
         };
         Ok(Self {
             endpoint,
@@ -231,16 +279,76 @@ async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), 
             started: Instant::now(),
         },
     );
-    // The auth stream stays open as the control channel; it is served from C14 on.
-    let _control = (auth_send, auth_recv);
     let transport = QuicTransport::new(conn);
+    let (control_tx, control_rx) = mpsc::channel(64);
+    tokio::spawn(write_control(auth_send, control_rx));
+    let nat = UdpNat::new(
+        transport.clone(),
+        state.clone(),
+        control_tx.clone(),
+        state.udp,
+        state.udp_counter(accepted.device),
+    );
+    tokio::spawn(read_control(auth_recv, nat.clone(), control_tx));
+    let datagrams = {
+        let (transport, nat) = (transport.clone(), nat.clone());
+        tokio::spawn(async move {
+            while let Ok(datagram) = transport.recv_datagram().await {
+                nat.handle(datagram).await;
+            }
+        })
+    };
     while let Ok((send, recv)) = transport.accept_stream().await {
         let state = state.clone();
         tokio::spawn(async move { proxy::handle_stream(send, recv, &state).await });
     }
+    datagrams.abort();
+    nat.shutdown();
     state.sessions.remove(sid);
     tracing::info!(sid = format_args!("{sid:x}"), "session ended");
     Ok(())
+}
+
+/// Writes control frames to the client, each in an HTTP/3 `DATA` frame on the auth stream.
+async fn write_control(mut send: quinn::SendStream, mut frames: mpsc::Receiver<ControlFrame>) {
+    while let Some(frame) = frames.recv().await {
+        let mut body = Vec::new();
+        if frame.encode(&mut body).is_err() {
+            continue;
+        }
+        if send.write_all(&encode_data_frame(&body)).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Serves the client's control frames: answers `Ping`, closes UDP sessions on `UdpClose`.
+async fn read_control(
+    mut recv: quinn::RecvStream,
+    nat: Arc<UdpNat>,
+    reply: mpsc::Sender<ControlFrame>,
+) {
+    let (mut data, mut frames) = (DataFrameReader::default(), ControlReader::default());
+    let mut buf = vec![0u8; 4096];
+    while let Ok(Some(n)) = recv.read(&mut buf).await {
+        let Ok(bytes) = data.push(&buf[..n]) else {
+            return;
+        };
+        let Ok(parsed) = frames.push(&bytes) else {
+            return;
+        };
+        for frame in parsed {
+            match frame {
+                ControlFrame::Ping { nonce } => {
+                    let _ = reply.try_send(ControlFrame::Pong { nonce });
+                }
+                ControlFrame::UdpClose { session_id, .. } => {
+                    nat.close(session_id);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Reads the auth request from the first bidi stream; answers success or `404`.

@@ -168,6 +168,51 @@ fn is_known(ty: u64) -> bool {
     )
 }
 
+/// `UdpClose` reasons.
+pub mod udp_close {
+    /// Closed on request or normally.
+    pub const NORMAL: u8 = 0;
+    /// Idle longer than the timeout.
+    pub const IDLE: u8 = 1;
+    /// Over the device's UDP session limit.
+    pub const LIMIT: u8 = 2;
+    /// Destination not allowed or not resolvable.
+    pub const NOT_ALLOWED: u8 = 3;
+}
+
+/// Largest partial frame buffered by [`ControlReader`].
+const MAX_BUFFERED: usize = MAX_CONTROL_BODY + 32;
+
+/// Splits a control channel byte stream into frames, whatever the read boundaries.
+#[derive(Debug, Default)]
+pub struct ControlReader {
+    buf: Vec<u8>,
+}
+
+impl ControlReader {
+    /// Feeds bytes; returns the frames they complete. Unknown extension frames are skipped.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<ControlFrame>, DecodeError> {
+        self.buf.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+        let mut pos = 0;
+        loop {
+            match ControlFrame::decode(&self.buf[pos..]) {
+                Ok((frame, used)) => {
+                    frames.extend(frame);
+                    pos += used;
+                }
+                Err(DecodeError::Incomplete) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        self.buf.drain(..pos);
+        if self.buf.len() > MAX_BUFFERED {
+            return Err(DecodeError::LengthLimit(self.buf.len() as u64));
+        }
+        Ok(frames)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +394,21 @@ mod tests {
             ControlFrame::decode(&[0x40, 0x10, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(DecodeError::NonMinimalVarint)
         );
+    }
+
+    #[test]
+    fn reader_reassembles_frames_across_reads() {
+        let frames = samples();
+        let mut wire = Vec::new();
+        for f in &frames {
+            f.encode(&mut wire).unwrap();
+        }
+        let mut reader = ControlReader::default();
+        let mut got = Vec::new();
+        for chunk in wire.chunks(7) {
+            got.extend(reader.push(chunk).unwrap());
+        }
+        assert_eq!(got, frames);
+        assert!(ControlReader::default().push(&[0x15]).is_err());
     }
 }
