@@ -11,7 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 client-core.workspace = true
+lexopt.workspace = true
+log.workspace = true
+proto.workspace = true
 socks5.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+transport.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+server.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "process"] }

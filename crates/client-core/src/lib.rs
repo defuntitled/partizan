@@ -5,6 +5,12 @@
 
 #![forbid(unsafe_code)]
 
+mod session;
+mod tcp;
+
+pub use session::{Engine, EngineConfig, EngineError, Status};
+pub use tcp::{AsyncReadWrite, ConnectError, TcpRequest, relay};
+
 #[cfg(test)]
 mod tests {
     #[test]

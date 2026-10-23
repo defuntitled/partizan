@@ -122,6 +122,23 @@ fn map_connection_error(e: ConnectionError) -> TransportError {
     }
 }
 
+/// Reset code inside an I/O error from a quinn stream.
+pub(crate) fn reset_code(e: &io::Error) -> Option<ErrorCode> {
+    let inner = e.get_ref()?;
+    let code = if let Some(read) = inner.downcast_ref::<quinn::ReadError>() {
+        match read {
+            quinn::ReadError::Reset(code) => *code,
+            _ => return None,
+        }
+    } else {
+        match inner.downcast_ref::<quinn::WriteError>()? {
+            quinn::WriteError::Stopped(code) => *code,
+            _ => return None,
+        }
+    };
+    Some(ErrorCode(code.into_inner()))
+}
+
 fn code(code: ErrorCode) -> VarInt {
     VarInt::from_u64(code.0).unwrap_or(VarInt::MAX)
 }

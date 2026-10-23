@@ -33,6 +33,12 @@ pub type SendHalf = Box<dyn SendStream>;
 /// Boxed receiving half.
 pub type RecvHalf = Box<dyn RecvStream>;
 
+/// Code the peer reset a stream with, from a read or write error on a [`RecvHalf`] /
+/// [`SendHalf`]; `None` for other errors.
+pub fn reset_code(e: &std::io::Error) -> Option<ErrorCode> {
+    quic::reset_code(e)
+}
+
 /// Connection-level failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransportError {

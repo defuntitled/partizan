@@ -152,7 +152,12 @@ dependencies = [
 name = "client-core"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "log",
  "proto",
+ "quinn",
+ "thiserror",
+ "tokio",
  "transport",
 ]
 
@@ -161,7 +166,13 @@ name = "client-openwrt"
 version = "0.1.0"
 dependencies = [
  "client-core",
+ "lexopt",
+ "log",
+ "proto",
+ "server",
  "socks5",
+ "tokio",
+ "transport",
 ]
 
 [[package]]
@@ -1398,6 +1409,10 @@ name = "socks5"
 version = "0.1.0"
 dependencies = [
  "client-core",
+ "log",
+ "proto",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
