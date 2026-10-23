@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use proto::auth::DeviceId;
+use proto::{ControlFrame, ErrorCode};
+use tokio::sync::mpsc;
 
 /// One authenticated connection.
 #[derive(Debug, Clone)]
@@ -21,6 +23,10 @@ pub struct Session {
     pub transport: &'static str,
     /// When it was established.
     pub started: Instant,
+    /// Its control channel.
+    pub control: mpsc::Sender<ControlFrame>,
+    /// The connection, to close it.
+    pub conn: quinn::Connection,
 }
 
 /// Session table.
@@ -56,6 +62,35 @@ impl Sessions {
             .iter()
             .map(|(&sid, s)| (sid, s.clone()))
             .collect()
+    }
+
+    /// Sends `GoAway` to every session of `device` (all sessions if `None`); with
+    /// [`ErrorCode::REVOKED`] the connections are closed after a short grace so the frame
+    /// arrives first. Returns how many sessions were told.
+    pub fn go_away(&self, device: Option<DeviceId>, code: ErrorCode, retry_after_ms: u64) -> usize {
+        let targets: Vec<Session> = self
+            .lock()
+            .values()
+            .filter(|s| device.is_none_or(|d| d == s.device))
+            .cloned()
+            .collect();
+        for session in &targets {
+            let _ = session.control.try_send(ControlFrame::GoAway {
+                code,
+                retry_after_ms,
+            });
+            if code == ErrorCode::REVOKED {
+                let conn = session.conn.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    conn.close(
+                        quinn::VarInt::from_u64(code.0).unwrap_or(quinn::VarInt::MAX),
+                        b"revoked",
+                    );
+                });
+            }
+        }
+        targets.len()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Session>> {

@@ -469,6 +469,7 @@ config client 'main'
 | `partizan run --uri-file … --socks 127.0.0.1:1080 [--honest-connect]` | Основной режим, запускается procd. `--uri-file` читает ссылку из файла (в аргументах она видна в `ps`); `--uri` — для отладки |
 | `partizan status` | JSON через unix-сокет: состояние, транспорт, RTT, байты, потоки, UDP-сессии, дропы, переподключения |
 | `partizan check --uri …` | Пробное подключение по обоим транспортам с диагностикой |
+| `partizan rebind` | Перепривязать QUIC-сокет после смены WAN-адреса (вызывает hotplug-скрипт `ifup wan`) |
 | `partizan version` | Версия бинаря и протокола |
 
 ### procd и упаковка

@@ -67,9 +67,10 @@ endef
 endif
 
 define Package/partizan/install
-	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config
+	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config $(1)/etc/hotplug.d/iface
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/partizan $(1)/usr/bin/partizan
 	$(INSTALL_BIN) ./files/partizan.init $(1)/etc/init.d/partizan
+	$(INSTALL_DATA) ./files/partizan.hotplug $(1)/etc/hotplug.d/iface/90-partizan
 	# INSTALL_CONF installs with mode 0600: the config holds the token.
 	$(INSTALL_CONF) ./files/partizan.config $(1)/etc/config/partizan
 endef

@@ -18,6 +18,7 @@ usage: partizan run (--uri URI | --uri-file PATH) [--socks ADDR] [--log-level LE
                     [--honest-connect] [--admin-sock PATH]
        partizan check (--uri URI | --uri-file PATH)
        partizan status [--admin-sock PATH]
+       partizan rebind [--admin-sock PATH]
        partizan version";
 const DEFAULT_SOCKS: &str = "127.0.0.1:1080";
 
@@ -29,8 +30,9 @@ enum Command {
         honest: bool,
         admin: PathBuf,
     },
-    Status {
+    Admin {
         admin: PathBuf,
+        command: &'static str,
     },
     Check {
         uri: ConnectionUri,
@@ -77,8 +79,20 @@ fn parse_args() -> Result<Command, String> {
             _ => return Err(format!("{}\n{USAGE}", fail(arg.unexpected()))),
         }
     }
-    if command == "status" {
-        return Ok(Command::Status { admin });
+    match command.as_str() {
+        "status" => {
+            return Ok(Command::Admin {
+                admin,
+                command: "status",
+            });
+        }
+        "rebind" => {
+            return Ok(Command::Admin {
+                admin,
+                command: "rebind",
+            });
+        }
+        _ => {}
     }
     let uri = ConnectionUri::parse(&uri.ok_or("--uri or --uri-file is required")?)
         .map_err(|e| e.to_string())?;
@@ -140,7 +154,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Status { admin } => match admin::query(&admin) {
+        Command::Admin { admin, command } => match admin::query(&admin, command) {
             Ok(json) => {
                 print!("{json}");
                 ExitCode::SUCCESS
@@ -207,10 +221,9 @@ async fn run(uri: ConnectionUri, socks: SocketAddr, honest: bool, admin: PathBuf
     };
     let engine = engine(uri);
     tokio::spawn(admin::serve(admin, engine.clone()));
-    // Warm the session so the first connection does not wait for the handshake.
-    if let Err(e) = engine.connect().await {
-        log::warn!("initial connection failed, will retry on demand: {e}");
-    }
+    // The supervisor connects right away, so the first connection does not wait for the
+    // handshake, and keeps reconnecting from then on.
+    engine.start();
     let socks = listener.local_addr().unwrap_or(socks);
     log::info!("SOCKS5 on {socks}");
     let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {

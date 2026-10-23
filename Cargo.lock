@@ -153,9 +153,12 @@ name = "client-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "getrandom 0.3.4",
  "log",
  "proto",
  "quinn",
+ "rcgen",
+ "server",
  "thiserror",
  "tokio",
  "transport",

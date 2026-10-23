@@ -185,9 +185,8 @@ impl Drop for UdpFlow {
     fn drop(&mut self) {
         self.engine.inner.udp.lock().remove(&self.id);
         // Best effort: tell the live session; an idle timeout covers a missed close.
-        if let Ok(slot) = self.engine.inner.session.try_lock()
-            && let Some(session) = slot.as_ref().filter(|s| s.is_alive())
-        {
+        let current = self.engine.inner.current.borrow().clone();
+        if let Some(session) = current.filter(|s| s.is_alive()) {
             let _ = session.control.try_send(ControlFrame::UdpClose {
                 session_id: self.id,
                 reason: udp_close::NORMAL,

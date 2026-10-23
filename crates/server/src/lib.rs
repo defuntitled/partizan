@@ -63,6 +63,8 @@ pub struct Metrics {
     pub udp_malformed_drops: AtomicU64,
     /// Datagrams to destinations the egress policy refuses.
     pub udp_denied_drops: AtomicU64,
+    /// QUIC connections accepted (authenticated or not).
+    pub connections: AtomicU64,
 }
 
 impl Metrics {
@@ -185,6 +187,11 @@ impl Server {
         self.state.clone()
     }
 
+    /// Endpoint handle; closing it stops [`Server::run`].
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
     /// Serves connections until the endpoint closes.
     pub async fn run(self) {
         while let Some(incoming) = self.endpoint.accept().await {
@@ -244,6 +251,7 @@ fn load_certificate(
 /// Authenticates one QUIC connection and serves its streams.
 async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), String> {
     let conn = incoming.await.map_err(|e| e.to_string())?;
+    state.metrics.connections.fetch_add(1, Ordering::Relaxed);
     // The client's HTTP/3 control stream and any other unidirectional streams: read and drop.
     let uni = conn.clone();
     tokio::spawn(async move {
@@ -268,6 +276,7 @@ async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), 
         .map(|d| d.name.clone())
         .unwrap_or_default();
     tracing::info!(device = %accepted.device, name = %name, sid = format_args!("{sid:x}"), "session started");
+    let (control_tx, control_rx) = mpsc::channel(64);
     state.sessions.insert(
         sid,
         Session {
@@ -277,10 +286,11 @@ async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), 
             client_version: accepted.client.client_version,
             transport: "quic",
             started: Instant::now(),
+            control: control_tx.clone(),
+            conn: conn.clone(),
         },
     );
     let transport = QuicTransport::new(conn);
-    let (control_tx, control_rx) = mpsc::channel(64);
     tokio::spawn(write_control(auth_send, control_rx));
     let nat = UdpNat::new(
         transport.clone(),
@@ -300,7 +310,13 @@ async fn handle_connection(incoming: Incoming, state: Arc<State>) -> Result<(), 
     };
     while let Ok((send, recv)) = transport.accept_stream().await {
         let state = state.clone();
-        tokio::spawn(async move { proxy::handle_stream(send, recv, &state).await });
+        let conn = transport.connection().clone();
+        tokio::spawn(async move {
+            let closed = async move {
+                conn.closed().await;
+            };
+            proxy::handle_stream(send, recv, &state, closed).await;
+        });
     }
     datagrams.abort();
     nat.shutdown();

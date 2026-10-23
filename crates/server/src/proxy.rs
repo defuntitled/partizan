@@ -18,8 +18,21 @@ const COPY_BUFFER: usize = 64 * 1024;
 /// Time allowed for the header to arrive.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Serves one stream until both directions are closed.
-pub async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, state: &State) {
+/// Serves one stream until both directions are closed, or until `session_closed` resolves:
+/// a dead session must not leave target sockets open.
+pub async fn handle_stream(
+    send: SendHalf,
+    recv: RecvHalf,
+    state: &State,
+    session_closed: impl Future<Output = ()>,
+) {
+    tokio::select! {
+        () = serve(send, recv, state) => {}
+        () = session_closed => {}
+    }
+}
+
+async fn serve(mut send: SendHalf, mut recv: RecvHalf, state: &State) {
     let header = tokio::time::timeout(HEADER_TIMEOUT, read_header(&mut recv)).await;
     let (connect, early) = match header {
         Ok(Ok(Some(header))) => header,
@@ -66,8 +79,9 @@ pub async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, state: &State
         tokio::io::copy_buf(&mut tcp_read, &mut send).await?;
         send.shutdown().await
     };
-    let (up, down) = tokio::join!(up, down);
-    if up.is_err() || down.is_err() {
+    // A broken direction ends both: a half that waits on an idle peer would leak.
+    let failed = tokio::try_join!(up, down).is_err();
+    if failed {
         send.reset(ErrorCode::NO_ERROR);
         recv.stop(ErrorCode::NO_ERROR);
     }

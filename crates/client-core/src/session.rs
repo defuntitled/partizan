@@ -1,8 +1,11 @@
 //! The session with the server: QUIC connection, auth exchange, shared by all streams.
+//!
+//! With [`Engine::start`] a supervisor keeps the session up: it reconnects with exponential
+//! backoff and jitter, obeys `GoAway`, and stops for good when the device is revoked.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use proto::auth::{
@@ -10,15 +13,25 @@ use proto::auth::{
     SessionInfo, Transport as AuthTransport, client_control_stream, encode_data_frame,
 };
 use proto::control::ControlReader;
-use proto::{ControlFrame, UdpDatagram};
-use quinn::Endpoint;
-use tokio::sync::{Mutex, mpsc};
+use proto::{ControlFrame, ErrorCode, UdpDatagram};
+use quinn::{ConnectionError, Endpoint};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::AbortHandle;
 use transport::quic::{self, QuicTransport};
 use transport::tls::{self, ALPN_H3, ServerVerification};
 use transport::{QuicConfig, Transport, TransportStats};
 
 use crate::udp::UdpRegistry;
+
+/// How long a new connection waits for a session before failing.
+pub const SESSION_WAIT: Duration = Duration::from_secs(5);
+/// QUIC handshake deadline; past it the server counts as unreachable over QUIC.
+pub const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Reconnect backoff bounds.
+const BACKOFF_MIN: Duration = Duration::from_millis(500);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Longest `retry_after_ms` honoured from a `GoAway`.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(600);
 
 /// What the engine needs to reach the server.
 #[derive(Debug, Clone)]
@@ -43,6 +56,12 @@ pub enum EngineError {
     /// Auth exchange failed.
     #[error("handshake failed: {0}")]
     Handshake(#[from] HandshakeError),
+    /// The server revoked this device; no more attempts.
+    #[error("device revoked by the server")]
+    Revoked,
+    /// No session within [`SESSION_WAIT`].
+    #[error("no session to the server")]
+    Unavailable,
 }
 
 /// Session snapshot for `status`.
@@ -64,6 +83,17 @@ pub struct Status {
     pub udp_drops: u64,
     /// Sessions established after the first.
     pub reconnects: u64,
+    /// The server revoked this device.
+    pub revoked: bool,
+}
+
+/// Why a session ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum End {
+    Revoked,
+    Shutdown(Duration),
+    Idle,
+    Lost(String),
 }
 
 /// An authenticated connection.
@@ -72,15 +102,35 @@ pub(crate) struct Session {
     pub(crate) info: SessionInfo,
     /// Frames to send on the control channel.
     pub(crate) control: mpsc::Sender<ControlFrame>,
-    // Kept open for the session's lifetime: the endpoint socket and the HTTP/3 control stream.
-    _endpoint: Endpoint,
+    endpoint: Endpoint,
+    /// `GoAway` from the server: code and retry delay.
+    go_away: watch::Receiver<Option<(ErrorCode, u64)>>,
+    // Kept open for the session's lifetime.
     _h3_control: quinn::SendStream,
     tasks: Vec<AbortHandle>,
 }
 
 impl Session {
+    /// Usable for new streams: open and not told to go away.
     pub(crate) fn is_alive(&self) -> bool {
-        self.transport.connection().close_reason().is_none()
+        self.transport.connection().close_reason().is_none() && self.go_away.borrow().is_none()
+    }
+
+    async fn ended(&self) -> End {
+        let mut go_away = self.go_away.clone();
+        tokio::select! {
+            e = self.transport.connection().closed() => match e {
+                ConnectionError::ApplicationClosed(c)
+                    if c.error_code.into_inner() == ErrorCode::REVOKED.0 => End::Revoked,
+                other => End::Lost(other.to_string()),
+            },
+            Ok(g) = go_away.wait_for(Option::is_some) => match *g {
+                Some((ErrorCode::REVOKED, _)) => End::Revoked,
+                Some((ErrorCode::IDLE_TIMEOUT, _)) => End::Idle,
+                Some((_, ms)) => End::Shutdown(Duration::from_millis(ms).min(RETRY_AFTER_MAX)),
+                None => End::Lost("go away".into()),
+            },
+        }
     }
 }
 
@@ -100,19 +150,27 @@ pub struct Engine {
 
 pub(crate) struct Inner {
     config: EngineConfig,
-    pub(crate) session: Mutex<Option<Arc<Session>>>,
+    pub(crate) current: watch::Sender<Option<Arc<Session>>>,
+    connecting: Mutex<()>,
+    supervised: AtomicBool,
+    revoked: AtomicBool,
+    demand: Notify,
     pub(crate) udp: Arc<UdpRegistry>,
     pub(crate) tcp_streams: AtomicUsize,
     sessions_established: AtomicU64,
 }
 
 impl Engine {
-    /// Engine for `config`; no connection is made until [`Engine::connect`] or first use.
+    /// Engine for `config`; no connection is made until [`Engine::start`] or first use.
     pub fn new(config: EngineConfig) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config,
-                session: Mutex::new(None),
+                current: watch::Sender::new(None),
+                connecting: Mutex::new(()),
+                supervised: AtomicBool::new(false),
+                revoked: AtomicBool::new(false),
+                demand: Notify::new(),
                 udp: Arc::new(UdpRegistry::default()),
                 tcp_streams: AtomicUsize::new(0),
                 sessions_established: AtomicU64::new(0),
@@ -120,37 +178,102 @@ impl Engine {
         }
     }
 
-    /// Brings the session up now, so the first connection does not wait for a handshake.
+    /// Keeps a session up in the background from now on (the daemon mode).
+    pub fn start(&self) {
+        if !self.inner.supervised.swap(true, Ordering::AcqRel) {
+            tokio::spawn(supervise(self.clone()));
+        }
+    }
+
+    /// One session now, without the supervisor (for `check`).
     pub async fn connect(&self) -> Result<SessionInfo, EngineError> {
         Ok(self.session().await?.info)
     }
 
-    /// The live session, establishing one if needed. Concurrent callers share one attempt.
-    pub(crate) async fn session(&self) -> Result<Arc<Session>, EngineError> {
-        let mut slot = self.inner.session.lock().await;
-        if let Some(session) = slot.as_ref().filter(|s| s.is_alive()) {
-            return Ok(session.clone());
-        }
-        let session = Arc::new(establish(&self.inner.config, self.inner.udp.clone()).await?);
-        // UDP sessions of the old connection are gone on the server; the next datagram of every
-        // flow carries its address again.
+    fn live(&self) -> Option<Arc<Session>> {
+        self.inner
+            .current
+            .borrow()
+            .as_ref()
+            .filter(|s| s.is_alive())
+            .cloned()
+    }
+
+    fn publish(&self, session: Arc<Session>) {
+        // UDP sessions of an older connection are gone on the server; the next datagram of
+        // every flow carries its address again.
         self.inner.udp.reset_all();
         self.inner
             .sessions_established
             .fetch_add(1, Ordering::Relaxed);
-        *slot = Some(session.clone());
-        Ok(session)
+        self.inner.current.send_replace(Some(session));
+    }
+
+    /// The live session. Under the supervisor, waits up to [`SESSION_WAIT`] for one; without
+    /// it, connects inline (concurrent callers share the attempt).
+    pub(crate) async fn session(&self) -> Result<Arc<Session>, EngineError> {
+        if self.inner.revoked.load(Ordering::Acquire) {
+            return Err(EngineError::Revoked);
+        }
+        if let Some(session) = self.live() {
+            return Ok(session);
+        }
+        if !self.inner.supervised.load(Ordering::Acquire) {
+            let _guard = self.inner.connecting.lock().await;
+            if let Some(session) = self.live() {
+                return Ok(session);
+            }
+            let session = Arc::new(establish(&self.inner.config, self.inner.udp.clone()).await?);
+            self.publish(session.clone());
+            return Ok(session);
+        }
+        self.inner.demand.notify_one();
+        let mut rx = self.inner.current.subscribe();
+        let wait = async {
+            loop {
+                if self.inner.revoked.load(Ordering::Acquire) {
+                    return Err(EngineError::Revoked);
+                }
+                if let Some(session) = rx.borrow_and_update().as_ref().filter(|s| s.is_alive()) {
+                    return Ok(session.clone());
+                }
+                if rx.changed().await.is_err() {
+                    return Err(EngineError::Unavailable);
+                }
+            }
+        };
+        tokio::time::timeout(SESSION_WAIT, wait)
+            .await
+            .unwrap_or(Err(EngineError::Unavailable))
+    }
+
+    /// Moves the QUIC socket to a fresh local port after a WAN address change; connection
+    /// migration keeps the session and its calls.
+    pub fn rebind(&self) -> Result<(), EngineError> {
+        let Some(session) = self.live() else {
+            return Ok(());
+        };
+        let bind: SocketAddr = match session.endpoint.local_addr() {
+            Ok(SocketAddr::V6(_)) => "[::]:0",
+            _ => "0.0.0.0:0",
+        }
+        .parse()
+        .expect("literal address");
+        quic::rebind(&session.endpoint, bind).map_err(|e| EngineError::Connect(e.to_string()))?;
+        log::info!("rebound the QUIC socket");
+        Ok(())
     }
 
     /// Current state.
     pub async fn status(&self) -> Status {
-        let slot = self.inner.session.lock().await;
-        let live = slot.as_ref().filter(|s| s.is_alive());
+        let live = self.live();
         Status {
             connected: live.is_some(),
-            transport: live.map(|_| "quic"),
-            session: live.map(|s| s.info),
-            stats: live.map_or_else(TransportStats::default, |s| s.transport.stats()),
+            transport: live.as_ref().map(|_| "quic"),
+            session: live.as_ref().map(|s| s.info),
+            stats: live
+                .as_ref()
+                .map_or_else(TransportStats::default, |s| s.transport.stats()),
             tcp_streams: self.inner.tcp_streams.load(Ordering::Relaxed),
             udp_flows: self.inner.udp.len(),
             udp_drops: self.inner.udp.drops.load(Ordering::Relaxed),
@@ -159,8 +282,72 @@ impl Engine {
                 .sessions_established
                 .load(Ordering::Relaxed)
                 .saturating_sub(1),
+            revoked: self.inner.revoked.load(Ordering::Acquire),
         }
     }
+}
+
+/// Keeps one session up until the device is revoked.
+async fn supervise(engine: Engine) {
+    let inner = &engine.inner;
+    let mut failures = 0u32;
+    loop {
+        match establish(&inner.config, inner.udp.clone()).await {
+            Ok(session) => {
+                failures = 0;
+                let session = Arc::new(session);
+                engine.publish(session.clone());
+                let end = session.ended().await;
+                // New streams wait for the next session; open ones keep the old connection.
+                inner.current.send_if_modified(|current| {
+                    let same = current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &session));
+                    if same {
+                        *current = None;
+                    }
+                    same
+                });
+                drop(session);
+                match end {
+                    End::Revoked => {
+                        log::error!("the server revoked this device; not reconnecting");
+                        inner.revoked.store(true, Ordering::Release);
+                        inner.current.send_replace(None);
+                        return;
+                    }
+                    End::Shutdown(retry) => {
+                        log::info!(
+                            "server going away, reconnecting in {} ms",
+                            retry.as_millis()
+                        );
+                        tokio::time::sleep(retry).await;
+                        continue;
+                    }
+                    End::Idle => {
+                        log::info!("session idle; reconnecting on demand");
+                        inner.demand.notified().await;
+                        continue;
+                    }
+                    End::Lost(reason) => log::warn!("session lost: {reason}"),
+                }
+            }
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                log::warn!("connecting failed (attempt {failures}): {e}");
+            }
+        }
+        tokio::time::sleep(backoff(failures)).await;
+    }
+}
+
+/// `0.5 s · 2^n` capped at 30 s, scaled by a random factor in [0.5, 1).
+fn backoff(failures: u32) -> Duration {
+    let base = BACKOFF_MIN
+        .saturating_mul(1 << failures.min(16))
+        .min(BACKOFF_MAX);
+    let mut seed = [0u8; 2];
+    let _ = getrandom::fill(&mut seed);
+    let jitter = 0.5 + f64::from(u16::from_le_bytes(seed)) / f64::from(u16::MAX) / 2.0;
+    base.mul_f64(jitter.min(0.999))
 }
 
 /// Resolves the server, connects over QUIC and runs the auth exchange.
@@ -179,9 +366,13 @@ async fn establish(config: &EngineConfig, udp: Arc<UdpRegistry>) -> Result<Sessi
     let endpoint = quic::client_endpoint(bind, tls, &config.quic)
         .map_err(|e| EngineError::Connect(e.to_string()))?;
     let started = Instant::now();
-    let transport = quic::connect(&endpoint, addr, uri.server_name())
-        .await
-        .map_err(|e| EngineError::Connect(e.to_string()))?;
+    let transport = tokio::time::timeout(
+        QUIC_HANDSHAKE_TIMEOUT,
+        quic::connect(&endpoint, addr, uri.server_name()),
+    )
+    .await
+    .map_err(|_| EngineError::Connect(format!("QUIC handshake with {addr} timed out")))?
+    .map_err(|e| EngineError::Connect(e.to_string()))?;
     let conn = transport.connection().clone();
     let auth = async {
         let mut h3_control = conn.open_uni().await.map_err(io)?;
@@ -209,9 +400,16 @@ async fn establish(config: &EngineConfig, udp: Arc<UdpRegistry>) -> Result<Sessi
         .map_err(|_| EngineError::Handshake(HandshakeError::Timeout))??;
     let info = established.session;
     let (control, control_rx) = mpsc::channel(64);
+    let (go_away_tx, go_away) = watch::channel(None);
     let tasks = vec![
         tokio::spawn(write_control(send, control_rx)).abort_handle(),
-        tokio::spawn(read_control(recv, established.leftover, udp.clone())).abort_handle(),
+        tokio::spawn(read_control(
+            recv,
+            established.leftover,
+            udp.clone(),
+            go_away_tx,
+        ))
+        .abort_handle(),
         tokio::spawn(read_datagrams(transport.clone(), udp)).abort_handle(),
     ];
     log::info!(
@@ -224,7 +422,8 @@ async fn establish(config: &EngineConfig, udp: Arc<UdpRegistry>) -> Result<Sessi
         transport,
         info,
         control,
-        _endpoint: endpoint,
+        endpoint,
+        go_away,
         _h3_control: h3_control,
         tasks,
     })
@@ -243,7 +442,12 @@ async fn write_control(mut send: quinn::SendStream, mut frames: mpsc::Receiver<C
 }
 
 /// Handles the server's control frames.
-async fn read_control(mut recv: quinn::RecvStream, leftover: Vec<u8>, udp: Arc<UdpRegistry>) {
+async fn read_control(
+    mut recv: quinn::RecvStream,
+    leftover: Vec<u8>,
+    udp: Arc<UdpRegistry>,
+    go_away: watch::Sender<Option<(ErrorCode, u64)>>,
+) {
     let (mut data, mut frames) = (DataFrameReader::default(), ControlReader::default());
     let mut bytes = leftover;
     let mut buf = vec![0u8; 4096];
@@ -255,9 +459,19 @@ async fn read_control(mut recv: quinn::RecvStream, leftover: Vec<u8>, udp: Arc<U
             return;
         };
         for frame in parsed {
-            if let ControlFrame::UdpClose { session_id, reason } = frame {
-                log::debug!("server closed UDP session {session_id} (reason {reason})");
-                udp.server_closed(session_id);
+            match frame {
+                ControlFrame::UdpClose { session_id, reason } => {
+                    log::debug!("server closed UDP session {session_id} (reason {reason})");
+                    udp.server_closed(session_id);
+                }
+                ControlFrame::GoAway {
+                    code,
+                    retry_after_ms,
+                } => {
+                    log::info!("GoAway {code:?}, retry after {retry_after_ms} ms");
+                    go_away.send_replace(Some((code, retry_after_ms)));
+                }
+                _ => {}
             }
         }
         match recv.read(&mut buf).await {
@@ -294,4 +508,24 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr, EngineError> {
     addrs
         .next()
         .ok_or_else(|| EngineError::Resolve(format!("{host}: no addresses")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_with_jitter_and_caps() {
+        for _ in 0..100 {
+            let first = backoff(0);
+            assert!(first >= BACKOFF_MIN / 2 && first < BACKOFF_MIN, "{first:?}");
+            let third = backoff(2);
+            assert!(
+                third >= Duration::from_secs(1) && third < Duration::from_secs(2),
+                "{third:?}"
+            );
+            let late = backoff(30);
+            assert!(late >= BACKOFF_MAX / 2 && late < BACKOFF_MAX, "{late:?}");
+        }
+    }
 }
