@@ -1,0 +1,55 @@
+[package]
+name = "proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+proto = { path = "../crates/proto" }
+
+# Own workspace: built with nightly via `cargo +nightly fuzz`, outside the main one.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux"
+path = "fuzz_targets/mux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_request"
+path = "fuzz_targets/auth_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_response"
+path = "fuzz_targets/auth_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uri"
+path = "fuzz_targets/uri.rs"
+test = false
+doc = false
+bench = false

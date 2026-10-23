@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +21,7 @@ getrandom = "0.3"
 sha2 = "0.10"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"
