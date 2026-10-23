@@ -7,11 +7,10 @@ mod logger;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
 
 use client_core::{Engine, EngineConfig};
 use log::LevelFilter;
-use proto::auth::{ClientInfo, ConnectionUri};
+use proto::auth::{ClientInfo, ConnectionUri, TransportMode};
 use transport::QuicConfig;
 
 const USAGE: &str = "\
@@ -131,11 +130,16 @@ fn parse_args() -> Result<Command, String> {
 }
 
 fn engine(uri: ConnectionUri) -> Engine {
-    Engine::new(EngineConfig {
+    Engine::new(config(uri))
+}
+
+fn config(uri: ConnectionUri) -> EngineConfig {
+    EngineConfig {
         uri,
         quic: QuicConfig::default(),
         info: ClientInfo::new("openwrt", env!("CARGO_PKG_VERSION")),
-    })
+        fallback_memory: client_core::FALLBACK_MEMORY,
+    }
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -223,23 +227,37 @@ fn main() -> ExitCode {
     }
 }
 
+/// Tries both transports and reports each; succeeds if the configured mode can connect.
 async fn check(uri: ConnectionUri) -> ExitCode {
     let server = format!("{}:{}", uri.host, uri.port);
-    let started = Instant::now();
-    match engine(uri).connect().await {
-        Ok(session) => {
-            println!(
-                "ok: QUIC to {server}, authenticated in {} ms, caps {:x}, udp-max {}",
-                started.elapsed().as_millis(),
-                session.caps.0,
-                session.udp_max
-            );
-            ExitCode::SUCCESS
+    let mode = uri.transport;
+    let config = config(uri);
+    let mut works = Vec::new();
+    for (name, transport) in [
+        ("QUIC", TransportMode::Quic),
+        ("TCP+TLS", TransportMode::Tls),
+    ] {
+        match client_core::check_transport(config.clone(), transport).await {
+            Ok((session, elapsed)) => {
+                println!(
+                    "ok: {name} to {server}, authenticated in {} ms, caps {:x}, udp-max {}",
+                    elapsed.as_millis(),
+                    session.caps.0,
+                    session.udp_max
+                );
+                works.push(transport);
+            }
+            Err(e) => println!("failed: {name} to {server}: {e}"),
         }
-        Err(e) => {
-            println!("failed: QUIC to {server}: {e}");
-            ExitCode::FAILURE
-        }
+    }
+    let usable = match mode {
+        TransportMode::Auto => !works.is_empty(),
+        only => works.contains(&only),
+    };
+    if usable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

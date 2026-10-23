@@ -9,7 +9,9 @@ mod session;
 mod tcp;
 mod udp;
 
-pub use session::{Engine, EngineConfig, EngineError, Status};
+pub use session::{
+    Engine, EngineConfig, EngineError, FALLBACK_MEMORY, SESSION_WAIT, Status, check_transport,
+};
 pub use tcp::{AsyncReadWrite, ConnectError, TcpRequest};
 pub use udp::{UdpFlow, UdpReply, UdpSendError};
 

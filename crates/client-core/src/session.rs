@@ -47,7 +47,14 @@ pub struct EngineConfig {
     pub quic: QuicConfig,
     /// Client info sent in `x-client`.
     pub info: ClientInfo,
+    /// In `auto` mode, how long to stay on TCP+TLS after QUIC failed before trying QUIC again.
+    pub fallback_memory: Duration,
 }
+
+/// Default for [`EngineConfig::fallback_memory`].
+pub const FALLBACK_MEMORY: Duration = Duration::from_secs(600);
+/// Grace for streams on the old connection after switching back to QUIC.
+const SWITCH_GRACE: Duration = Duration::from_secs(30);
 
 /// Session setup failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -166,6 +173,8 @@ pub(crate) struct Inner {
     pub(crate) udp: Arc<UdpRegistry>,
     pub(crate) tcp_streams: AtomicUsize,
     sessions_established: AtomicU64,
+    /// `auto` mode: QUIC failed, use TCP+TLS until then.
+    tls_until: std::sync::Mutex<Option<Instant>>,
 }
 
 impl Engine {
@@ -182,6 +191,7 @@ impl Engine {
                 udp: Arc::new(UdpRegistry::default()),
                 tcp_streams: AtomicUsize::new(0),
                 sessions_established: AtomicU64::new(0),
+                tls_until: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -231,7 +241,7 @@ impl Engine {
             if let Some(session) = self.live() {
                 return Ok(session);
             }
-            let session = Arc::new(establish(&self.inner.config, self.inner.udp.clone()).await?);
+            let session = Arc::new(establish(self).await?);
             self.publish(session.clone());
             return Ok(session);
         }
@@ -300,12 +310,42 @@ async fn supervise(engine: Engine) {
     let inner = &engine.inner;
     let mut failures = 0u32;
     loop {
-        match establish(&inner.config, inner.udp.clone()).await {
+        match establish(&engine).await {
             Ok(session) => {
                 failures = 0;
-                let session = Arc::new(session);
+                let mut session = Arc::new(session);
                 engine.publish(session.clone());
-                let end = session.ended().await;
+                let end = loop {
+                    let probe_at = engine.probe_at(&session);
+                    let probe = async {
+                        match probe_at {
+                            Some(at) => tokio::time::sleep_until(at.into()).await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        end = session.ended() => break end,
+                        () = probe => {
+                            match establish_quic(&inner.config, inner.udp.clone()).await {
+                                Ok(quic) => {
+                                    log::info!("QUIC works again; switching back from TCP+TLS");
+                                    *inner.tls_until.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                    let old = std::mem::replace(&mut session, Arc::new(quic));
+                                    engine.publish(session.clone());
+                                    // Streams still on the old connection get a grace period.
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(SWITCH_GRACE).await;
+                                        old.transport.close(ErrorCode::NO_ERROR, b"switched");
+                                    });
+                                }
+                                Err(e) => {
+                                    log::debug!("QUIC probe failed: {e}");
+                                    engine.remember_tls();
+                                }
+                            }
+                        }
+                    }
+                };
                 // New streams wait for the next session; open ones keep the old connection.
                 inner.current.send_if_modified(|current| {
                     let same = current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &session));
@@ -359,11 +399,77 @@ fn backoff(failures: u32) -> Duration {
 }
 
 /// Connects over the transport the URI asks for and runs the auth exchange.
-async fn establish(config: &EngineConfig, udp: Arc<UdpRegistry>) -> Result<Session, EngineError> {
+async fn establish(engine: &Engine) -> Result<Session, EngineError> {
+    let (config, udp) = (&engine.inner.config, engine.inner.udp.clone());
     match config.uri.transport {
         TransportMode::Tls => establish_tls(config, udp).await,
-        TransportMode::Quic | TransportMode::Auto => establish_quic(config, udp).await,
+        TransportMode::Quic => establish_quic(config, udp).await,
+        TransportMode::Auto => {
+            if engine.tls_remembered() {
+                return establish_tls(config, udp).await;
+            }
+            match establish_quic(config, udp.clone()).await {
+                Ok(session) => Ok(session),
+                // Only a transport failure says QUIC is blocked; a rejection would repeat on TCP.
+                Err(e @ EngineError::Handshake(_)) => Err(e),
+                Err(e) => {
+                    log::warn!("QUIC failed ({e}); falling back to TCP+TLS");
+                    engine.remember_tls();
+                    establish_tls(config, udp).await
+                }
+            }
+        }
     }
+}
+
+impl Engine {
+    fn tls_remembered(&self) -> bool {
+        let until = *self
+            .inner
+            .tls_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        until.is_some_and(|t| Instant::now() < t)
+    }
+
+    fn remember_tls(&self) {
+        let until = Instant::now() + self.inner.config.fallback_memory;
+        *self
+            .inner
+            .tls_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(until);
+    }
+
+    /// When to try QUIC again from a fallback session; `None` if not in `auto` fallback.
+    fn probe_at(&self, session: &Session) -> Option<Instant> {
+        if self.inner.config.uri.transport != TransportMode::Auto || session.kind != "tls" {
+            return None;
+        }
+        let until = *self
+            .inner
+            .tls_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Some(until.unwrap_or_else(Instant::now))
+    }
+}
+
+/// One session over the given transport, for `partizan check`; returns it with its setup time.
+pub async fn check_transport(
+    mut config: EngineConfig,
+    mode: TransportMode,
+) -> Result<(SessionInfo, Duration), EngineError> {
+    config.uri.transport = mode;
+    let started = Instant::now();
+    let udp = Arc::new(UdpRegistry::default());
+    let session = match mode {
+        TransportMode::Tls => establish_tls(&config, udp).await?,
+        _ => establish_quic(&config, udp).await?,
+    };
+    let elapsed = started.elapsed();
+    session.transport.close(ErrorCode::NO_ERROR, b"check");
+    Ok((session.info, elapsed))
 }
 
 /// QUIC with the HTTP/3 auth exchange on the first bidi stream.
