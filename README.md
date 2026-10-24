@@ -48,8 +48,8 @@ Bash и доступ к GitHub по HTTPS. Для сервера откройт�
 На Debian/Ubuntu установите инструменты для скачивания:
 
 ```sh
-sudo apt-get update
-sudo apt-get install -y bash curl ca-certificates tar gzip coreutils
+sudo apt update
+sudo apt install -y bash curl ca-certificates tar gzip coreutils
 ```
 
 На OpenWrt выполните от root:
@@ -59,7 +59,7 @@ opkg update
 opkg install bash curl ca-bundle jq tar gzip coreutils-sha256sum
 ```
 
-Установщики предложат установить остальные зависимости через apt-get, dnf
+Установщики предложат установить остальные зависимости через apt, dnf
 или opkg. На Linux без systemd автоматическая установка не поддерживается.
 
 ### 2. Скачайте установщики
