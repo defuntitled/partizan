@@ -66,10 +66,16 @@ pub fn parse(buf: &[u8]) -> Result<ClientHello, HelloError> {
             return Err(HelloError::NotClientHello);
         }
         let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        // A plaintext TLS record cannot exceed 2^14 bytes. Reject its length before
+        // waiting for or copying attacker-controlled payloads.
+        if len > MAX_CLIENT_HELLO {
+            return Err(HelloError::NotClientHello);
+        }
         let body = buf
             .get(pos + 5..pos + 5 + len)
             .ok_or(HelloError::Incomplete)?;
-        message.extend_from_slice(body);
+        let room = MAX_CLIENT_HELLO - message.len();
+        message.extend_from_slice(&body[..body.len().min(room)]);
         pos += 5 + len;
         if message.len() >= 4 {
             if message[0] != 1 {
@@ -392,5 +398,13 @@ mod tests {
         split.extend_from_slice(&msg[10..]);
         assert_eq!(parse(&split).unwrap().ja4(), parse(&full).unwrap().ja4());
         assert!(is_grease(0x2a2a) && is_grease(0xfafa) && !is_grease(0x1301));
+    }
+
+    #[test]
+    fn c23_t3_oversize_record_is_rejected_before_its_payload_arrives() {
+        assert_eq!(
+            parse(&[22, 3, 1, 0xff, 0xff]),
+            Err(HelloError::NotClientHello)
+        );
     }
 }

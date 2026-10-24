@@ -5,6 +5,14 @@ context-snapshot.json
 .agents
 session-log.md
 skills-lock.json
+.codex
+.codegraph
+opencode.jsonc
+context-snapshot.json
+.mcp.json
+
+#env
+.vscode
 
 
 # Build output

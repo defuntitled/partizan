@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use proto::auth::{
     ClientHandshake, ClientInfo, ConnectionUri, HANDSHAKE_TIMEOUT, HandshakeError, SessionInfo,
-    Transport as AuthTransport, TransportMode, client_control_stream,
+    Transport as AuthTransport, TransportMode, client_control_stream_seeded,
 };
 use proto::control::ControlReader;
 use proto::mux::Role;
@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::task::AbortHandle;
 use transport::quic::{self, QuicControl};
 use transport::tcp::MuxTransport;
-use transport::tls::{self, ALPN_H3, ALPN_HTTP11, ServerVerification};
+use transport::tls::{ALPN_HTTP11, ServerVerification};
 use transport::{ControlChannel, QuicConfig, Transport, TransportError, TransportStats};
 
 use crate::udp::UdpRegistry;
@@ -122,7 +122,7 @@ pub(crate) struct Session {
     go_away: watch::Receiver<Option<(ErrorCode, u64)>>,
     closed: watch::Receiver<bool>,
     // Kept open for the session's lifetime (QUIC: the HTTP/3 control stream).
-    _h3_control: Option<quinn::SendStream>,
+    _h3_streams: Vec<quinn::SendStream>,
     tasks: Vec<AbortHandle>,
 }
 
@@ -480,9 +480,8 @@ async fn establish_quic(
     udp: Arc<UdpRegistry>,
 ) -> Result<Session, EngineError> {
     let uri = &config.uri;
+    require_supported_auth(uri)?;
     let addr = resolve(&uri.host, uri.port).await?;
-    let tls = tls::client_config(ServerVerification::from_uri(uri), &[ALPN_H3])
-        .map_err(|e| EngineError::Connect(e.to_string()))?;
     let bind: SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -490,8 +489,12 @@ async fn establish_quic(
     }
     .parse()
     .expect("literal address");
-    let endpoint = quic::client_endpoint(bind, tls, &config.quic)
-        .map_err(|e| EngineError::Connect(e.to_string()))?;
+    let endpoint = transport::boring_quic::client_endpoint(
+        bind,
+        ServerVerification::from_uri(uri),
+        &config.quic,
+    )
+    .map_err(|e| EngineError::Connect(e.to_string()))?;
     let started = Instant::now();
     let transport = tokio::time::timeout(
         QUIC_HANDSHAKE_TIMEOUT,
@@ -503,10 +506,16 @@ async fn establish_quic(
     let conn = transport.connection().clone();
     let auth = async {
         let mut h3_control = conn.open_uni().await.map_err(io)?;
+        let mut seed = [0; 8];
+        getrandom::fill(&mut seed).map_err(|e| EngineError::Connect(e.to_string()))?;
         h3_control
-            .write_all(&client_control_stream())
+            .write_all(&client_control_stream_seeded(u64::from_ne_bytes(seed)))
             .await
             .map_err(io)?;
+        let mut encoder = conn.open_uni().await.map_err(io)?;
+        encoder.write_all(&[2]).await.map_err(io)?;
+        let mut decoder = conn.open_uni().await.map_err(io)?;
+        decoder.write_all(&[3]).await.map_err(io)?;
         let (mut send, mut recv) = conn.open_bi().await.map_err(io)?;
         let (mut handshake, request) =
             ClientHandshake::start(AuthTransport::Quic, uri, &config.info, Instant::now())?;
@@ -518,7 +527,7 @@ async fn establish_quic(
                 return Err(EngineError::Handshake(HandshakeError::Rejected));
             }
             if let Some(established) = handshake.handle_input(&buf[..n])? {
-                return Ok((established, h3_control, send, recv));
+                return Ok((established, vec![h3_control, encoder, decoder], send, recv));
             }
         }
     };
@@ -536,7 +545,7 @@ async fn establish_quic(
         established.session,
         "quic",
         Some(endpoint),
-        Some(h3_control),
+        h3_control,
         udp,
     ))
 }
@@ -547,6 +556,7 @@ async fn establish_tls(
     udp: Arc<UdpRegistry>,
 ) -> Result<Session, EngineError> {
     let uri = &config.uri;
+    require_supported_auth(uri)?;
     let addr = resolve(&uri.host, uri.port).await?;
     // Chrome's ClientHello on BoringSSL; it offers h2 and http/1.1, our server picks http/1.1.
     let started = Instant::now();
@@ -591,9 +601,20 @@ async fn establish_tls(
         established.session,
         "tls",
         None,
-        None,
+        Vec::new(),
         udp,
     ))
+}
+
+// Until C24 authenticates the server by HMAC, Web PKI alone would accept the
+// masquerade site's real certificate and send our device token to that site.
+fn require_supported_auth(uri: &ConnectionUri) -> Result<(), EngineError> {
+    if uri.passthrough.is_some() {
+        return Err(EngineError::Connect(
+            "passthrough mark authentication is not implemented".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Starts the control channel and datagram tasks of a fresh session.
@@ -603,7 +624,7 @@ fn start_session(
     info: SessionInfo,
     kind: &'static str,
     endpoint: Option<Endpoint>,
-    h3_control: Option<quinn::SendStream>,
+    h3_streams: Vec<quinn::SendStream>,
     udp: Arc<UdpRegistry>,
 ) -> Session {
     log::info!("sid {:x}, caps {:x}", info.sid, info.caps.0);
@@ -629,7 +650,7 @@ fn start_session(
         endpoint,
         go_away,
         closed,
-        _h3_control: h3_control,
+        _h3_streams: h3_streams,
         tasks,
     }
 }
@@ -706,6 +727,38 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unsupported_passthrough_never_resolves_or_sends_credentials() {
+        let uri = ConnectionUri {
+            device_id: proto::auth::DeviceId([7; 16]),
+            token: proto::auth::Token::from_bytes([9; 32]),
+            host: "invalid host".into(),
+            port: 443,
+            sni: None,
+            path: "/auth".into(),
+            pin: None,
+            transport: TransportMode::Tls,
+            insecure: true,
+            passthrough: Some(proto::auth::Passthrough {
+                public_key: [1; 32],
+                short_id: [2; 8],
+            }),
+        };
+        let config = EngineConfig {
+            uri,
+            quic: QuicConfig::default(),
+            info: ClientInfo::new("test", "test"),
+            fallback_memory: FALLBACK_MEMORY,
+        };
+        for mode in [TransportMode::Tls, TransportMode::Quic] {
+            let error = check_transport(config.clone(), mode).await.unwrap_err();
+            assert_eq!(
+                error,
+                EngineError::Connect("passthrough mark authentication is not implemented".into())
+            );
+        }
+    }
 
     #[test]
     fn backoff_grows_with_jitter_and_caps() {

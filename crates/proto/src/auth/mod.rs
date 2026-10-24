@@ -20,7 +20,10 @@ use std::time::{Duration, Instant};
 
 use zeroize::{Zeroize, Zeroizing};
 
-pub use h3::{DataFrameError, DataFrameReader, client_control_stream, encode_data_frame};
+pub use h3::{
+    CHROME_SETTINGS, DataFrameError, DataFrameReader, client_control_stream,
+    client_control_stream_seeded, encode_data_frame,
+};
 pub use secret::{DeviceId, Token, TokenHash};
 pub use uri::{ConnectionUri, Passthrough, TransportMode, UriError, format_pin, parse_pin_base64};
 

@@ -3,6 +3,7 @@ name = "proto-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
+license = "AGPL-3.0-only"
 
 [package.metadata]
 cargo-fuzz = true

@@ -1947,7 +1947,9 @@ dependencies = [
  "foreign-types",
  "proto",
  "quinn",
+ "quinn-proto",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-webpki",
  "serde",
@@ -1959,6 +1961,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

@@ -4,6 +4,8 @@
 //! under pressure they are dropped.
 
 #[cfg(feature = "chrome")]
+pub mod boring_quic;
+#[cfg(feature = "chrome")]
 pub mod chrome;
 mod config;
 pub mod quic;

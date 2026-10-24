@@ -54,7 +54,7 @@ pub const PROFILE: Profile = Profile {
 };
 
 /// Chrome advertises brotli certificate compression; decompression only.
-struct Brotli;
+pub(crate) struct Brotli;
 
 impl CertificateCompressor for Brotli {
     const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::BROTLI;
@@ -152,7 +152,7 @@ fn add_alps(ssl: &mut boring::ssl::SslRef) -> io::Result<()> {
 }
 
 /// Checks the server's chain (leaf first) like the rustls client does.
-fn verify(
+pub(crate) fn verify(
     chain: &[Vec<u8>],
     server_name: &str,
     verification: ServerVerification,

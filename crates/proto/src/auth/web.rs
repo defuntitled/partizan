@@ -88,7 +88,7 @@ pub fn decode_response_for_tests(buf: &[u8]) -> Option<(Vec<(String, String)>, u
 
 /// Opening bytes of a server's HTTP/3 control stream: `SETTINGS`, dynamic table off.
 pub fn h3_server_control_stream() -> Vec<u8> {
-    h3::client_control_stream()
+    h3::server_control_stream()
 }
 
 #[cfg(test)]

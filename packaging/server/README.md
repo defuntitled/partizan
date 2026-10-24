@@ -2,6 +2,9 @@
 
 Static binary, systemd or Docker. Commands assume a Debian-like VPS.
 
+For interactive installation from the latest GitHub Release (including TLS setup,
+systemd and the first client link), see [the installer guide](../INSTALL.md).
+
 ## Binary
 
 ```sh

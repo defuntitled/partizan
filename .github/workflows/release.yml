@@ -1,0 +1,215 @@
+name: Release
+run-name: Release build · ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish GitHub Release v<workspace version> for the installers
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  binaries:
+    name: Build ${{ matrix.archive }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: server
+            binary: partizan-server
+            target: x86_64-unknown-linux-musl
+            profile: release
+            archive: server-linux-x86_64
+            machine: Advanced Micro Devices X86-64
+          - package: client-openwrt
+            binary: partizan
+            target: x86_64-unknown-linux-musl
+            profile: release-client
+            archive: client-linux-x86_64
+            machine: Advanced Micro Devices X86-64
+          - package: client-openwrt
+            binary: partizan
+            target: aarch64-unknown-linux-musl
+            profile: release-client
+            archive: client-openwrt-armv8
+            machine: AArch64
+    env:
+      PACKAGE: ${{ matrix.package }}
+      BINARY: ${{ matrix.binary }}
+      TARGET: ${{ matrix.target }}
+      PROFILE: ${{ matrix.profile }}
+      ARCHIVE: ${{ matrix.archive }}
+      ELF_MACHINE: ${{ matrix.machine }}
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential cmake clang libclang-dev pkg-config binutils file jq
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Load the pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}-${{ matrix.package }}
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --version 0.24.0 --locked
+      - name: Configure musl headers for BoringSSL bindgen
+        run: |
+          zig_lib=$(zig env | jq -r .lib_dir)
+          target_arch="${TARGET%%-*}"
+          printf '%s=%s\n' "BINDGEN_EXTRA_CLANG_ARGS_${TARGET//-/_}" \
+            "-I$zig_lib/libc/include/$target_arch-linux-musl -I$zig_lib/libc/include/generic-musl -I$zig_lib/libc/include/any-linux-any" >> "$GITHUB_ENV"
+      - name: Build the release binary
+        run: cargo zigbuild --locked --profile "$PROFILE" --package "$PACKAGE" --bin "$BINARY" --target "$TARGET"
+      - name: Verify architecture, static linking and client size
+        run: |
+          binary_path="target/$TARGET/$PROFILE/$BINARY"
+          file "$binary_path"
+          readelf --file-header "$binary_path" | grep -q "Machine:.*$ELF_MACHINE"
+          if readelf --program-headers "$binary_path" | grep -q INTERP; then
+            echo "Binary requires a dynamic linker" >&2
+            exit 1
+          fi
+          if [[ "$PACKAGE" == client-openwrt ]]; then
+            scripts/check-size.sh "$binary_path" 5242880
+          fi
+      - name: Package the binary and license
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          stem="partizan-$version-$ARCHIVE"
+          stage="$RUNNER_TEMP/package/$stem"
+          mkdir -p "$stage" dist
+          install -m 755 "target/$TARGET/$PROFILE/$BINARY" "$stage/$BINARY"
+          install -m 644 LICENSE "$stage/LICENSE"
+          printf 'version=%s\ncommit=%s\ntarget=%s\nprofile=%s\n' \
+            "$version" "$(git rev-parse HEAD)" "$TARGET" "$PROFILE" > "$stage/BUILD-INFO"
+          tar --sort=name --mtime="@$(git log -1 --format=%ct)" \
+            --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP/package" -cf - "$stem" | gzip -n > "dist/$stem.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binary-${{ matrix.archive }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  archives:
+    name: Assemble release archives
+    needs: binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-binary-*
+          path: dist
+          merge-multiple: true
+      - name: Archive the matching source revision
+        id: source
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          stem="partizan-$version-source"
+          git archive --format=tar --prefix="$stem/" HEAD | gzip -n > "dist/$stem.tar.gz"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Package the interactive installers
+        run: |
+          stage="$RUNNER_TEMP/installers"
+          mkdir -p "$stage/partizan-installers/scripts" \
+            "$stage/partizan-installers/packaging/server" \
+            "$stage/partizan-installers/packaging/linux" \
+            "$stage/partizan-installers/packaging/openwrt/partizan/files"
+          cp scripts/install-{common,server,client}.sh "$stage/partizan-installers/scripts/"
+          cp packaging/server/partizan-server.service "$stage/partizan-installers/packaging/server/"
+          cp packaging/linux/partizan-client.service "$stage/partizan-installers/packaging/linux/"
+          cp packaging/openwrt/partizan/files/partizan.{init,hotplug} "$stage/partizan-installers/packaging/openwrt/partizan/files/"
+          cp LICENSE packaging/INSTALL.md "$stage/partizan-installers/"
+          tar --sort=name --mtime="@$(git log -1 --format=%ct)" \
+            --owner=0 --group=0 --numeric-owner \
+            -C "$stage" -cf - partizan-installers | gzip -n > dist/partizan-installers.tar.gz
+      - name: Generate and verify SHA-256 checksums
+        working-directory: dist
+        run: |
+          archives=(*.tar.gz)
+          test "${#archives[@]}" -eq 5
+          sha256sum "${archives[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: partizan-release-${{ steps.source.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - name: Write the build summary
+        run: |
+          {
+            echo '### Release archives'
+            printf 'Commit: `%s`\n\n' "$(git rev-parse HEAD)"
+            echo 'Download the `partizan-release-*` artifact from this workflow run.'
+            echo
+            echo '```text'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish GitHub Release
+    if: ${{ inputs.publish }}
+    needs: archives
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_VERSION: ${{ needs.archives.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: partizan-release-${{ needs.archives.outputs.version }}
+          path: dist
+      - name: Publish the archives for this exact revision
+        run: |
+          tag="v$RELEASE_VERSION"
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            test "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA" || {
+              echo "Tag $tag points to another commit. Bump the workspace version." >&2
+              exit 1
+            }
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists. Bump the workspace version; existing assets are never overwritten." >&2
+            exit 1
+          fi
+          printf 'Static Linux x86_64 server/client, ARMv8 OpenWrt client, source and interactive installers.\n\nCommit: `%s`\n\nVerify downloads with `sha256sum --check SHA256SUMS`.\n' \
+            "$GITHUB_SHA" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS \
+            --draft --target "$GITHUB_SHA" --title "partizan $tag" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh release edit "$tag" --draft=false --latest
+          gh release view "$tag" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"

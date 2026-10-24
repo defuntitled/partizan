@@ -11,6 +11,7 @@ pub mod dial;
 pub mod egress;
 pub mod masquerade;
 pub mod metrics;
+mod passthrough;
 pub mod proxy;
 pub mod registry;
 pub mod sessions;
@@ -37,7 +38,7 @@ use quinn::{Endpoint, Incoming};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use transport::quic::{self, QuicControl, QuicTransport};
@@ -138,19 +139,42 @@ pub struct Server {
     acceptor: TlsAcceptor,
     state: Arc<State>,
     pin: [u8; 32],
+    passthrough: Option<(UdpSocket, SocketAddr)>,
 }
 
 impl Server {
     /// Loads certificates and the registry and binds UDP.
     pub async fn bind(config: Config) -> Result<Self, ServerError> {
-        if config.masquerade.mode == MasqueradeMode::Passthrough {
-            return Err(ServerError::Config(
-                "masquerade.mode = passthrough is not available yet".into(),
-            ));
-        }
+        let upstream = if config.masquerade.mode == MasqueradeMode::Passthrough {
+            let sni = config
+                .masquerade
+                .sni
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ServerError::Config("passthrough requires masquerade.sni".into()))?;
+            if sni.contains(['/', ':', '\0']) {
+                return Err(ServerError::Config(
+                    "masquerade.sni must be a DNS name".into(),
+                ));
+            }
+            Some(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tokio::net::lookup_host((sni, 443)),
+                )
+                .await
+                .map_err(|_| ServerError::Config("masquerade.sni resolution timed out".into()))??
+                .next()
+                .ok_or_else(|| {
+                    ServerError::Config("masquerade.sni resolved to no addresses".into())
+                })?,
+            )
+        } else {
+            None
+        };
         let (chain, key) = load_certificate(&config)?;
-        let source = match (config.tls.mode, &config.tls.cert, &config.tls.key) {
-            (TlsMode::Files, Some(cert), Some(key)) => certs::Source::Files {
+        let source = match (upstream, config.tls.mode, &config.tls.cert, &config.tls.key) {
+            (None, TlsMode::Files, Some(cert), Some(key)) => certs::Source::Files {
                 cert: cert.clone(),
                 key: key.clone(),
             },
@@ -166,10 +190,26 @@ impl Server {
             tls::server_config_with_resolver(certs.clone(), &[ALPN_H3]).map_err(bad_tls)?;
         let tcp_tls =
             tls::server_config_with_resolver(certs.clone(), &[ALPN_HTTP11]).map_err(bad_tls)?;
-        let endpoint = quic::server_endpoint(config.server.listen, quic_tls, &config.quic)?;
+        let (endpoint, passthrough) = if let Some(upstream) = upstream {
+            let socket = UdpSocket::bind(config.server.listen).await?;
+            // Private endpoint retains the existing shutdown handle, but never processes
+            // packets from the public UDP listener in passthrough mode.
+            (
+                Endpoint::client("127.0.0.1:0".parse().expect("loopback address"))?,
+                Some((socket, upstream)),
+            )
+        } else {
+            (
+                quic::server_endpoint(config.server.listen, quic_tls, &config.quic)?,
+                None,
+            )
+        };
         // TCP on the same port as UDP, also when the config asked for port 0.
         let mut tcp_addr = config.server.listen;
-        tcp_addr.set_port(endpoint.local_addr()?.port());
+        tcp_addr.set_port(match &passthrough {
+            Some((socket, _)) => socket.local_addr()?.port(),
+            None => endpoint.local_addr()?.port(),
+        });
         let tcp = TcpListener::bind(tcp_addr).await?;
         let acceptor = TlsAcceptor::from(Arc::new(tcp_tls));
         let registry = Registry::load(&config.server.devices).map_err(ServerError::Config)?;
@@ -202,10 +242,7 @@ impl Server {
             },
             udp_per_device: Mutex::new(HashMap::new()),
             sessions_per_device: config.limits.sessions_per_device.max(1) as usize,
-            site: masquerade::Site::new(
-                config.masquerade.dir.clone(),
-                endpoint.local_addr()?.port(),
-            ),
+            site: masquerade::Site::new(config.masquerade.dir.clone(), tcp.local_addr()?.port()),
             certs: certs.clone(),
             bench_udp: if config.bench.enabled {
                 Some(bench::spawn_udp_echo().await?)
@@ -226,12 +263,13 @@ impl Server {
             acceptor,
             state: Arc::new(state),
             pin,
+            passthrough,
         })
     }
 
     /// UDP address the server listens on.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.endpoint.local_addr()
+        self.tcp.local_addr()
     }
 
     /// SHA-256 of the certificate's SPKI, for connection URIs.
@@ -265,6 +303,15 @@ impl Server {
 
     /// Serves both listeners until the QUIC endpoint closes.
     pub async fn run(self) {
+        let public_addr = self.local_addr();
+        let upstream = self.passthrough.as_ref().map(|(_, upstream)| *upstream);
+        let relay = self.passthrough.map(|(socket, upstream)| {
+            tokio::spawn(async move {
+                if let Err(e) = passthrough::forward_udp(socket, upstream).await {
+                    tracing::error!(error = %e, "UDP passthrough stopped");
+                }
+            })
+        });
         // Renewed certificate files are picked up within the hour even without SIGHUP.
         let certs = self.state.certs.clone();
         let reloader = tokio::spawn(async move {
@@ -280,7 +327,7 @@ impl Server {
                 }
             }
         });
-        if let (Some(path), Ok(addr)) = (self.admin_sock.clone(), self.endpoint.local_addr()) {
+        if let (Some(path), Ok(addr)) = (self.admin_sock.clone(), public_addr) {
             let info = admin::Info {
                 pin: self.pin,
                 port: addr.port(),
@@ -298,14 +345,32 @@ impl Server {
                 self.stop.clone(),
             );
             tokio::spawn(async move {
+                let mut forwarded = tokio::task::JoinSet::new();
                 loop {
                     let accepted = tokio::select! {
                         accepted = tcp.accept() => accepted,
                         () = stop.notified() => return,
+                        _ = forwarded.join_next(), if !forwarded.is_empty() => continue,
                     };
                     let Ok((stream, _)) = accepted else {
                         continue;
                     };
+                    if let Some(upstream) = upstream {
+                        forwarded.spawn(async move {
+                            let mut stream = stream;
+                            let result = async {
+                                let prefix = passthrough::read_prefix(&mut stream).await?;
+                                // C23: no mark is accepted until C24 supplies its verifier.
+                                let _ = prefix.hello;
+                                passthrough::forward_tcp(stream, upstream, &prefix.bytes).await
+                            }
+                            .await;
+                            if let Err(e) = result {
+                                tracing::debug!(error = %e, "TCP passthrough ended");
+                            }
+                        });
+                        continue;
+                    }
                     let (acceptor, state) = (acceptor.clone(), state.clone());
                     tokio::spawn(async move {
                         if let Err(e) = handle_tcp(stream, acceptor, state).await {
@@ -324,6 +389,9 @@ impl Server {
             });
         }
         tcp.abort();
+        if let Some(relay) = relay {
+            relay.abort();
+        }
         reloader.abort();
     }
 }
@@ -373,7 +441,14 @@ fn load_certificate(
     config: &Config,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ServerError> {
     let bad = |what: &str| ServerError::Config(what.to_owned());
-    match config.tls.mode {
+    // C23 never sends a local certificate in passthrough. Keep the internal store usable
+    // without requiring a domain, certificate files or ACME for this mode.
+    let mode = if config.masquerade.mode == MasqueradeMode::Passthrough {
+        TlsMode::SelfSigned
+    } else {
+        config.tls.mode
+    };
+    match mode {
         TlsMode::Files => {
             let cert = config
                 .tls

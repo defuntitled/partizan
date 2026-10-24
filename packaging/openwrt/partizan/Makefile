@@ -14,6 +14,8 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=partizan
 PKG_VERSION:=0.1.0
 PKG_RELEASE:=1
+PKG_LICENSE:=AGPL-3.0-only
+PKG_LICENSE_FILES:=LICENSE
 
 PARTIZAN_SRC ?= $(CURDIR)/../../..
 PARTIZAN_BINARY ?=
@@ -49,7 +51,7 @@ endef
 ifeq ($(PARTIZAN_BINARY),)
 define Build/Prepare
 	$(INSTALL_DIR) $(PKG_BUILD_DIR)
-	$(CP) $(PARTIZAN_SRC)/Cargo.toml $(PARTIZAN_SRC)/Cargo.lock $(PARTIZAN_SRC)/crates $(PKG_BUILD_DIR)/
+	$(CP) $(PARTIZAN_SRC)/Cargo.toml $(PARTIZAN_SRC)/Cargo.lock $(PARTIZAN_SRC)/LICENSE $(PARTIZAN_SRC)/crates $(PKG_BUILD_DIR)/
 endef
 
 define Build/Compile
@@ -58,6 +60,7 @@ endef
 else
 define Build/Prepare
 	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	$(CP) $(PARTIZAN_SRC)/LICENSE $(PKG_BUILD_DIR)/
 endef
 
 define Build/Compile
@@ -67,6 +70,8 @@ endef
 endif
 
 define Package/partizan/install
+	$(INSTALL_DIR) $(1)/usr/share/licenses/partizan
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/LICENSE $(1)/usr/share/licenses/partizan/LICENSE
 	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config $(1)/etc/hotplug.d/iface
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/bin/partizan $(1)/usr/bin/partizan
 	$(INSTALL_BIN) ./files/partizan.init $(1)/etc/init.d/partizan

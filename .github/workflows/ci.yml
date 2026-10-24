@@ -13,6 +13,19 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  installers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash installers
+        run: |
+          for script in scripts/install-{common,server,client}.sh; do
+            bash -n "$script"
+          done
+          shellcheck -x scripts/install-{common,server,client}.sh
+      - name: Exercise installation and upgrade with a fake OS and release
+        run: python3 scripts/test-installers.py
+
   fmt:
     runs-on: ubuntu-latest
     steps:

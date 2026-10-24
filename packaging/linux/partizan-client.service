@@ -1,0 +1,22 @@
+[Unit]
+Description=partizan SOCKS5 client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=partizan
+Group=partizan
+EnvironmentFile=/etc/partizan/client.env
+ExecStart=/usr/local/bin/partizan run --uri-file /etc/partizan/client.uri --socks ${SOCKS_LISTEN} --admin-sock /run/partizan-client/admin.sock
+RuntimeDirectory=partizan-client
+RuntimeDirectoryMode=0750
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

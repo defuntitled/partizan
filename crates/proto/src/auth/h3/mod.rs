@@ -20,9 +20,37 @@ const STREAM_CONTROL: u64 = 0x00;
 /// included.
 const MAX_HEAD: usize = 16 * 1024;
 
-/// Opening bytes of the client's HTTP/3 control stream (unidirectional): an empty `SETTINGS`,
-/// so QPACK dynamic table capacity stays 0.
+/// Chrome's HTTP/3 SETTINGS, in browser order. Our server encodes only static QPACK entries.
+pub const CHROME_SETTINGS: &[(u64, u64)] = &[(1, 65536), (6, 262144), (7, 100), (0x33, 1)];
+
+/// Opening bytes of the client's HTTP/3 control stream, with the deterministic GREASE seed 0.
 pub fn client_control_stream() -> Vec<u8> {
+    client_control_stream_seeded(0)
+}
+
+/// Chrome-shaped SETTINGS, a reserved SETTINGS entry and a reserved frame, followed by a
+/// priority update for auth request stream 0. Pass fresh random bits for `seed` per connection.
+pub fn client_control_stream_seeded(seed: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_varint(STREAM_CONTROL, &mut out);
+    let mut settings = Vec::new();
+    for &(id, value) in CHROME_SETTINGS {
+        put_varint(id, &mut settings);
+        put_varint(value, &mut settings);
+    }
+    let grease = 0x21 + 0x1f * (seed % 0x10000);
+    put_varint(grease, &mut settings);
+    put_varint(0, &mut settings);
+    frame(FRAME_SETTINGS, &settings, &mut out);
+    frame(grease, &[], &mut out);
+    let mut priority = Vec::new();
+    put_varint(0, &mut priority);
+    priority.extend_from_slice(b"u=0");
+    frame(0xf0700, &priority, &mut out);
+    out
+}
+
+pub(crate) fn server_control_stream() -> Vec<u8> {
     let mut out = Vec::new();
     put_varint(STREAM_CONTROL, &mut out);
     frame(FRAME_SETTINGS, &[], &mut out);
@@ -202,6 +230,33 @@ pub(crate) use qpack::huffman_encode;
 mod tests {
     use super::*;
 
+    #[test]
+    fn c22_t1_http3_settings_and_grease_match_chrome_shape() {
+        let wire = client_control_stream_seeded(12345);
+        let mut pos = 0;
+        assert_eq!(read_varint(&wire, &mut pos), Some(0));
+        assert_eq!(read_varint(&wire, &mut pos), Some(4));
+        let len = read_varint(&wire, &mut pos).unwrap() as usize;
+        let end = pos + len;
+        for &(id, value) in CHROME_SETTINGS {
+            assert_eq!(read_varint(&wire, &mut pos), Some(id));
+            assert_eq!(read_varint(&wire, &mut pos), Some(value));
+        }
+        let grease = read_varint(&wire, &mut pos).unwrap();
+        assert_eq!((grease - 0x21) % 0x1f, 0);
+        assert_eq!(read_varint(&wire, &mut pos), Some(0));
+        assert_eq!(pos, end);
+        assert_eq!(read_varint(&wire, &mut pos), Some(grease));
+        assert_eq!(read_varint(&wire, &mut pos), Some(0));
+        assert_eq!(read_varint(&wire, &mut pos), Some(0xf0700));
+        assert_eq!(read_varint(&wire, &mut pos), Some(4));
+        assert_eq!(&wire[pos..], b"\0u=0");
+        assert_ne!(
+            client_control_stream_seeded(1),
+            client_control_stream_seeded(2)
+        );
+    }
+
     fn owned(fields: &[(&str, &str)]) -> Vec<(String, String)> {
         fields
             .iter()
@@ -293,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn control_stream_opens_with_empty_settings() {
-        assert_eq!(client_control_stream(), [0x00, 0x04, 0x00]);
+    fn server_control_stream_opens_with_empty_settings() {
+        assert_eq!(server_control_stream(), [0x00, 0x04, 0x00]);
     }
 }

@@ -4,6 +4,7 @@ members = ["crates/*"]
 exclude = ["fuzz"]
 
 [workspace.package]
+license = "AGPL-3.0-only"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
@@ -25,6 +26,8 @@ zeroize = { version = "1", features = ["derive"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 async-trait = "0.1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+quinn-proto = { version = "0.11", default-features = false }
+ring = "0.17"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1", features = ["derive"] }
