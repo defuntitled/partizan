@@ -70,7 +70,17 @@ elif name == 'systemctl' or '/etc/init.d/' in sys.argv[0]:
 elif name in ('partizan', 'partizan-server'):
     if args[0] == 'version': print('partizan 0.1.0 (protocol v1)')
     elif args[0] == 'check': sys.exit(1 if os.environ.get('INSTALLER_FAIL_CHECK') == '1' else 0)
-    elif args[0] == 'status': print(json.dumps({'connected': True}))
+    elif args[0] == 'status':
+        # Match admin::to_json: connection state is a string, not a boolean field.
+        states = os.environ.get('INSTALLER_STATES', 'connected').split(',')
+        counter = fixture / 'status-queries'
+        count = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(count + 1))
+        state = states[min(count, len(states) - 1)]
+        print(json.dumps({'state': state, 'transport': 'TCP+TLS' if state == 'connected' else None,
+                          'session': None, 'rtt_ms': 148, 'bytes_sent': 0, 'bytes_received': 0,
+                          'mtu': 1200, 'tcp_streams': 0, 'udp_flows': 0, 'udp_drops': 0,
+                          'reconnects': 0}))
     elif args[:2] == ['device', 'add']: print('partizan://generated-test-client')
 else:
     raise SystemExit('unexpected command: ' + name)
@@ -184,6 +194,31 @@ class Installers(unittest.TestCase):
         self.assertEqual(config.stat().st_mode & 0o777, 0o600)
         self.assertTrue((self.root / "etc/hotplug.d/iface/90-partizan").exists())
         self.assertIn("USE_PROCD=1", (self.fixture / "installed-procd-template").read_text())
+
+    def test_client_waits_for_connected_state_after_fallback(self):
+        self.env["INSTALLER_STATES"] = "connecting,connecting,connected"
+        self.run_installer("client", self.client_responses())
+        self.assertEqual((self.fixture / "status-queries").read_text(), "3")
+        self.assertTrue((self.root / "usr/local/bin/partizan").exists())
+        self.assertTrue((self.fixture / "active").exists())
+
+    def test_client_failed_health_check_can_be_reinstalled(self):
+        self.env["INSTALLER_STATES"] = "connecting"
+        self.run_installer("client", self.client_responses(), success=False)
+        self.assertFalse((self.root / "usr/local/bin/partizan").exists())
+        self.assertFalse((self.fixture / "active").exists())
+        uri = self.root / "etc/partizan/client.uri"
+        previous = uri.read_bytes()
+        self.env["INSTALLER_STATES"] = "connected"
+        self.run_installer("client", [("Обновить клиент", "y")])
+        self.assertEqual(uri.read_bytes(), previous)
+        self.assertTrue((self.root / "usr/local/bin/partizan").exists())
+        self.assertTrue((self.fixture / "active").exists())
+
+    def test_client_revoked_state_is_not_healthy(self):
+        self.env["INSTALLER_STATES"] = "revoked"
+        self.run_installer("client", self.client_responses(), success=False)
+        self.assertFalse((self.root / "usr/local/bin/partizan").exists())
 
     def test_checksum_mismatch_does_not_install(self):
         (self.fixture / "SHA256SUMS").write_text("0" * 64 + "  partizan-0.1.0-client-linux-x86_64.tar.gz\n")

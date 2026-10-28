@@ -109,7 +109,7 @@ main() {
     install_binary
     start_service
     for ((attempt = 0; attempt < 20; attempt++)); do
-        if "$DEST" status --admin-sock "$ADMIN_SOCKET" 2>/dev/null | jq -e '.connected == true' >/dev/null; then
+        if "$DEST" status --admin-sock "$ADMIN_SOCKET" 2>/dev/null | jq -e '.state == "connected"' >/dev/null; then
             BINARY_CHANGED=0
             say "Клиент установлен и подключён. Конфигурация: $CONFIG"
             return 0
