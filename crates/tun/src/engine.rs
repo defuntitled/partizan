@@ -57,7 +57,7 @@ pub(crate) fn target(addr: SocketAddr) -> TargetAddr {
     }
 }
 
-fn socket_addr(addr: &TargetAddr) -> Option<SocketAddr> {
+pub(crate) fn socket_addr(addr: &TargetAddr) -> Option<SocketAddr> {
     let ip = match &addr.host {
         Host::V4(ip) => (*ip).into(),
         Host::V6(ip) => (*ip).into(),

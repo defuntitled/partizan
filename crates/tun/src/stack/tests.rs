@@ -1,5 +1,5 @@
 //! The stack over a datagram socketpair: the far end plays the phone's apps with a second
-//! `smoltcp` interface, the handler echoes everything back.
+//! `smoltcp` interface, both handlers echo everything back and report what reached them.
 
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixDatagram as StdDatagram;
@@ -11,16 +11,18 @@ use tokio::net::UnixDatagram;
 use tokio::task::JoinHandle;
 
 use super::*;
-use crate::{FdDevice, StackMetrics};
+use crate::{FdDevice, IpNet, SplitConfig, SplitMode, SplitStats, StackMetrics};
 
-/// Echoes TCP and UDP, reporting every TCP destination.
+/// Echoes TCP and UDP, reporting every TCP destination and UDP flow with its path.
 struct Echo {
-    opened: mpsc::UnboundedSender<TargetAddr>,
+    path: Path,
+    opened: mpsc::UnboundedSender<(Path, TargetAddr)>,
+    flows: mpsc::UnboundedSender<(Path, SocketAddr)>,
 }
 
 impl Handler for Echo {
     fn tcp(&self, request: TcpRequest) {
-        let _ = self.opened.send(request.dst.clone());
+        let _ = self.opened.send((self.path, request.dst.clone()));
         tokio::spawn(async move {
             let (mut read, mut write) = tokio::io::split(request.io);
             let _ = tokio::io::copy(&mut read, &mut write).await;
@@ -30,10 +32,11 @@ impl Handler for Echo {
 
     fn udp(
         &self,
-        _source: SocketAddr,
+        source: SocketAddr,
         mut datagrams: mpsc::Receiver<UdpPacket>,
         replies: mpsc::Sender<UdpPacket>,
     ) {
+        let _ = self.flows.send((self.path, source));
         tokio::spawn(async move {
             while let Some(p) = datagrams.recv().await {
                 let reply = UdpPacket {
@@ -50,23 +53,45 @@ impl Handler for Echo {
 struct Harness {
     link: UnixDatagram,
     diag: Arc<Diagnostics>,
-    opened: mpsc::UnboundedReceiver<TargetAddr>,
+    split: Arc<Split>,
+    opened: mpsc::UnboundedReceiver<(Path, TargetAddr)>,
+    flows: mpsc::UnboundedReceiver<(Path, SocketAddr)>,
     stack: JoinHandle<io::Result<()>>,
 }
 
 fn start(config: Config, profiling: bool) -> Harness {
+    start_split(config, profiling, SplitConfig::default())
+}
+
+fn start_split(config: Config, profiling: bool, split: SplitConfig) -> Harness {
     let (ours, theirs) = StdDatagram::pair().unwrap();
     ours.set_nonblocking(true).unwrap();
     theirs.set_nonblocking(true).unwrap();
     let device = FdDevice::new(OwnedFd::from(ours)).unwrap();
     let diag = Arc::new(Diagnostics::default());
     diag.set(profiling, false);
-    let (tx, opened) = mpsc::unbounded_channel();
-    let stack = tokio::spawn(run(device, Echo { opened: tx }, config, diag.clone()));
+    let split = Arc::new(Split::new(&split));
+    let (opened_tx, opened) = mpsc::unbounded_channel();
+    let (flows_tx, flows) = mpsc::unbounded_channel();
+    let echo = |path| Echo {
+        path,
+        opened: opened_tx.clone(),
+        flows: flows_tx.clone(),
+    };
+    let stack = tokio::spawn(run(
+        device,
+        echo(Path::Tunnel),
+        echo(Path::Direct),
+        split.clone(),
+        config,
+        diag.clone(),
+    ));
     Harness {
         link: UnixDatagram::from_std(theirs).unwrap(),
         diag,
+        split,
         opened,
+        flows,
         stack,
     }
 }
@@ -220,10 +245,13 @@ async fn a01_t1_ipv4_tcp_reaches_handler_with_its_destination_and_echoes() {
     assert_eq!(apps.echo(&h.link, conn, b"ping").await, b"ping");
     assert_eq!(
         h.opened.try_recv().unwrap(),
-        TargetAddr {
-            host: Host::V4(Ipv4Addr::new(93, 184, 216, 34)),
-            port: 80
-        }
+        (
+            Path::Tunnel,
+            TargetAddr {
+                host: Host::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                port: 80
+            }
+        )
     );
     assert!(h.opened.try_recv().is_err(), "one connection, one request");
 
@@ -252,10 +280,13 @@ async fn a01_t2_ipv6_tcp_is_carried() {
     assert_eq!(apps.echo(&h.link, conn, &data).await, data);
     assert_eq!(
         h.opened.try_recv().unwrap(),
-        TargetAddr {
-            host: Host::V6("2001:db8::1".parse().unwrap()),
-            port: 443
-        }
+        (
+            Path::Tunnel,
+            TargetAddr {
+                host: Host::V6("2001:db8::1".parse().unwrap()),
+                port: 443
+            }
+        )
     );
 }
 
@@ -407,4 +438,128 @@ async fn connections_over_the_limit_are_refused() {
     let b = apps.connect(v4([1, 1, 1, 1], 443), 42001);
     apps.until(&h.link, |apps| apps.socket(b).state() == tcp::State::Closed)
         .await;
+}
+
+fn nets(list: &[&str]) -> Vec<IpNet> {
+    list.iter().map(|s| s.parse().unwrap()).collect()
+}
+
+fn tcp_dst(addr: SocketAddr) -> TargetAddr {
+    crate::engine::target(addr)
+}
+
+#[tokio::test]
+async fn a02_include_sends_listed_traffic_to_the_tunnel_and_the_rest_direct() {
+    let mut h = start_split(
+        Config::default(),
+        false,
+        SplitConfig {
+            mode: SplitMode::Include,
+            routes: nets(&["93.184.216.0/24", "2606:4700::/32"]),
+        },
+    );
+    let mut apps = Apps::new();
+    for (port, (dst, path)) in (43000..).zip([
+        (v4([93, 184, 216, 34], 443), Path::Tunnel),
+        (v4([1, 1, 1, 1], 443), Path::Direct),
+        (ip("[2606:4700::1111]:443"), Path::Tunnel),
+        (ip("[2001:db8::1]:443"), Path::Direct),
+    ]) {
+        let conn = apps.connect(dst, port);
+        assert_eq!(apps.echo(&h.link, conn, b"x").await, b"x");
+        assert_eq!(h.opened.try_recv().unwrap(), (path, tcp_dst(dst)), "{dst}");
+    }
+
+    // UDP: one source, two destinations on different paths, two flows.
+    let app = v4([10, 0, 0, 2], 5000);
+    udp_exchange(&h.link, app, v4([93, 184, 216, 1], 3478), b"in").await;
+    udp_exchange(&h.link, app, v4([8, 8, 4, 4], 3478), b"out").await;
+    assert_eq!(h.flows.try_recv().unwrap(), (Path::Tunnel, app));
+    assert_eq!(h.flows.try_recv().unwrap(), (Path::Direct, app));
+    // DNS goes through the tunnel even though the resolver is not listed.
+    udp_exchange(
+        &h.link,
+        v4([10, 0, 0, 2], 5001),
+        v4([192, 168, 1, 1], 53),
+        b"q",
+    )
+    .await;
+    assert_eq!(
+        h.flows.try_recv().unwrap(),
+        (Path::Tunnel, v4([10, 0, 0, 2], 5001))
+    );
+}
+
+#[tokio::test]
+async fn a02_exclude_sends_listed_traffic_direct() {
+    let mut h = start_split(
+        Config::default(),
+        false,
+        SplitConfig {
+            mode: SplitMode::Exclude,
+            routes: nets(&["192.168.0.0/16"]),
+        },
+    );
+    let mut apps = Apps::new();
+    let lan = apps.connect(v4([192, 168, 1, 10], 80), 44000);
+    apps.echo(&h.link, lan, b"x").await;
+    let wan = apps.connect(v4([1, 1, 1, 1], 80), 44001);
+    apps.echo(&h.link, wan, b"x").await;
+    assert_eq!(h.opened.try_recv().unwrap().0, Path::Direct);
+    assert_eq!(h.opened.try_recv().unwrap().0, Path::Tunnel);
+}
+
+#[tokio::test]
+async fn a02_rules_change_without_restarting_and_open_connections_keep_their_path() {
+    let mut h = start(Config::default(), false);
+    let mut apps = Apps::new();
+    let dst = v4([1, 1, 1, 1], 443);
+    let before = apps.connect(dst, 45000);
+    apps.echo(&h.link, before, b"a").await;
+    assert_eq!(h.opened.try_recv().unwrap().0, Path::Tunnel);
+
+    h.split.set(&SplitConfig {
+        mode: SplitMode::Include,
+        routes: Vec::new(),
+    });
+    let after = apps.connect(dst, 45001);
+    apps.echo(&h.link, after, b"b").await;
+    assert_eq!(h.opened.try_recv().unwrap().0, Path::Direct);
+    // The first connection still works, still through the tunnel.
+    assert_eq!(apps.echo(&h.link, before, b"c").await, b"c");
+    assert!(h.opened.try_recv().is_err());
+    assert!(!h.stack.is_finished());
+}
+
+#[tokio::test]
+async fn a02_traffic_is_counted_per_path() {
+    let h = start_split(
+        Config::default(),
+        false,
+        SplitConfig {
+            mode: SplitMode::Include,
+            routes: nets(&["93.184.216.34"]),
+        },
+    );
+    let mut apps = Apps::new();
+    let tunneled = apps.connect(v4([93, 184, 216, 34], 443), 46000);
+    apps.echo(&h.link, tunneled, &[1u8; 3000]).await;
+    let direct = apps.connect(v4([1, 1, 1, 1], 443), 46001);
+    apps.echo(&h.link, direct, &[2u8; 500]).await;
+    udp_exchange(
+        &h.link,
+        v4([10, 0, 0, 2], 6000),
+        v4([1, 1, 1, 1], 443),
+        &[3u8; 40],
+    )
+    .await;
+    assert_eq!(
+        h.split.stats(),
+        SplitStats {
+            tunnel_sent: 3000,
+            tunnel_received: 3000,
+            direct_sent: 540,
+            direct_received: 540,
+        }
+    );
 }

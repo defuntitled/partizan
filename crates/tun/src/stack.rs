@@ -3,7 +3,9 @@
 //! One task owns the interface, all sockets and the flow table. Each TCP connection is a
 //! `smoltcp` socket listening on the exact destination of its SYN (AnyIP mode), bridged to the
 //! handler through an in-memory duplex stream. UDP bypasses `smoltcp`: datagrams are parsed and
-//! built directly, one flow per source address.
+//! built directly, one flow per source address and path.
+//!
+//! Split tunneling picks the handler: a connection at its SYN, a datagram by its destination.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -29,6 +31,7 @@ use tokio::time::{Instant, Sleep};
 use crate::diagnostics::{Counters, Diagnostics};
 use crate::engine::target;
 use crate::packet::{self, Inbound};
+use crate::split::{Path, Rules, Split};
 use crate::{Config, Handler, PacketDevice, UdpPacket};
 
 /// Packets read, or replies taken, per wakeup before the task yields.
@@ -39,7 +42,7 @@ const OUT_QUEUE: usize = 1024;
 const DUPLEX_BUFFER: usize = 16 * 1024;
 /// Outgoing datagrams queued per UDP flow before new ones are dropped.
 const FLOW_QUEUE: usize = 256;
-/// Replies from all flows queued for the interface.
+/// Replies from all flows of one path queued for the interface.
 const REPLY_QUEUE: usize = 1024;
 /// A connection whose peer stops answering while data is outstanding is aborted after this.
 const TCP_TIMEOUT: SmolDuration = SmolDuration::from_secs(120);
@@ -51,20 +54,27 @@ const REPORT: Duration = Duration::from_secs(10);
 const MAX_PACKET: usize = 65_535;
 
 /// Runs the stack until the interface ends (a read returns 0 bytes) or fails. New
-/// connections and flows go to `handler`; `diagnostics` may be switched while it runs.
-pub async fn run<D: PacketDevice, H: Handler>(
+/// connections and flows go to `tunnel` or `direct` as `split` decides; `split` and
+/// `diagnostics` may be changed while it runs.
+pub async fn run<D: PacketDevice, T: Handler, R: Handler>(
     device: D,
-    handler: H,
+    tunnel: T,
+    direct: R,
+    split: Arc<Split>,
     config: Config,
     diagnostics: Arc<Diagnostics>,
 ) -> io::Result<()> {
-    let mut stack = Stack::new(device, handler, config, diagnostics);
+    let mut stack = Stack::new(device, tunnel, direct, split, config, diagnostics);
     std::future::poll_fn(|cx| stack.poll(cx)).await
 }
 
-struct Stack<D, H> {
+struct Stack<D, T, R> {
     device: D,
-    handler: H,
+    tunnel: T,
+    direct: R,
+    split: Arc<Split>,
+    /// Rules for the current iteration.
+    rules: Arc<Rules>,
     config: Config,
     diag: Arc<Diagnostics>,
     /// Profiling flag for the current iteration.
@@ -75,14 +85,27 @@ struct Stack<D, H> {
     tcp: HashMap<SocketHandle, Conn>,
     /// `(source, destination)` of every connection, so a retransmitted SYN opens nothing new.
     tuples: HashMap<(SocketAddr, SocketAddr), SocketHandle>,
-    udp: HashMap<SocketAddr, Flow>,
-    replies_tx: mpsc::Sender<UdpPacket>,
-    replies: mpsc::Receiver<UdpPacket>,
+    udp: HashMap<(SocketAddr, Path), Flow>,
+    tunnel_replies: Replies,
+    direct_replies: Replies,
     buf: Vec<u8>,
     epoch: Instant,
     timer: Pin<Box<Sleep>>,
     next_sweep: Instant,
     next_report: Instant,
+}
+
+/// Where the flows of one path send their replies.
+struct Replies {
+    tx: mpsc::Sender<UdpPacket>,
+    rx: mpsc::Receiver<UdpPacket>,
+}
+
+impl Replies {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel(REPLY_QUEUE);
+        Self { tx, rx }
+    }
 }
 
 /// `smoltcp`'s view of the interface: TCP packets queued for it, everything queued for the fd.
@@ -137,6 +160,7 @@ struct Conn {
     io: DuplexStream,
     src: SocketAddr,
     dst: SocketAddr,
+    path: Path,
     /// The handshake with the app completed.
     established: bool,
     /// The app's FIN was passed on to the handler.
@@ -147,7 +171,7 @@ struct Conn {
 
 /// One step of moving bytes between a socket and its stream.
 enum Step {
-    Moved,
+    Moved(usize),
     Eof,
     Pending,
     Failed,
@@ -155,7 +179,7 @@ enum Step {
 
 impl Conn {
     /// Moves what can be moved both ways; `true` if anything changed.
-    fn pump(&mut self, socket: &mut tcp::Socket<'_>, cx: &mut Context<'_>) -> bool {
+    fn pump(&mut self, socket: &mut tcp::Socket<'_>, cx: &mut Context<'_>, split: &Split) -> bool {
         use tcp::State;
         if !matches!(
             socket.state(),
@@ -169,11 +193,14 @@ impl Conn {
             let io = &mut self.io;
             let step = socket.recv(|buf| match Pin::new(io).poll_write(cx, buf) {
                 Poll::Ready(Ok(0)) | Poll::Pending => (0, Step::Pending),
-                Poll::Ready(Ok(n)) => (n, Step::Moved),
+                Poll::Ready(Ok(n)) => (n, Step::Moved(n)),
                 Poll::Ready(Err(_)) => (0, Step::Failed),
             });
             match step {
-                Ok(Step::Moved) => progress = true,
+                Ok(Step::Moved(n)) => {
+                    split.sent(self.path, n);
+                    progress = true;
+                }
                 Ok(Step::Pending) => break,
                 _ => {
                     socket.abort();
@@ -197,13 +224,19 @@ impl Conn {
                 let mut read = ReadBuf::new(buf);
                 match Pin::new(io).poll_read(cx, &mut read) {
                     Poll::Ready(Ok(())) if read.filled().is_empty() => (0, Step::Eof),
-                    Poll::Ready(Ok(())) => (read.filled().len(), Step::Moved),
+                    Poll::Ready(Ok(())) => {
+                        let n = read.filled().len();
+                        (n, Step::Moved(n))
+                    }
                     Poll::Ready(Err(_)) => (0, Step::Failed),
                     Poll::Pending => (0, Step::Pending),
                 }
             });
             match step {
-                Ok(Step::Moved) => progress = true,
+                Ok(Step::Moved(n)) => {
+                    split.received(self.path, n);
+                    progress = true;
+                }
                 Ok(Step::Pending) => break,
                 Ok(Step::Eof) => {
                     self.io_eof = true;
@@ -225,8 +258,15 @@ struct Flow {
     last: Instant,
 }
 
-impl<D: PacketDevice, H: Handler> Stack<D, H> {
-    fn new(device: D, handler: H, config: Config, diag: Arc<Diagnostics>) -> Self {
+impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
+    fn new(
+        device: D,
+        tunnel: T,
+        direct: R,
+        split: Arc<Split>,
+        config: Config,
+        diag: Arc<Diagnostics>,
+    ) -> Self {
         let mut phy = Phy {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
@@ -250,10 +290,12 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
                 128,
             ));
         });
-        let (replies_tx, replies) = mpsc::channel(REPLY_QUEUE);
         Self {
             device,
-            handler,
+            tunnel,
+            direct,
+            rules: split.rules(),
+            split,
             config,
             diag,
             profiling: false,
@@ -263,8 +305,8 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
             tcp: HashMap::new(),
             tuples: HashMap::new(),
             udp: HashMap::new(),
-            replies_tx,
-            replies,
+            tunnel_replies: Replies::new(),
+            direct_replies: Replies::new(),
             buf: vec![0u8; MAX_PACKET],
             epoch,
             timer: Box::pin(tokio::time::sleep_until(epoch)),
@@ -285,6 +327,7 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.profiling = self.diag.profiling();
+        self.rules = self.split.rules();
         let started = self.profiling.then(std::time::Instant::now);
         let mut io_time = Duration::ZERO;
         let mut packets = 0u64;
@@ -315,12 +358,18 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
         self.buf = buf;
 
         // Replies from UDP flows.
-        for i in 0..BATCH {
-            match self.replies.poll_recv(cx) {
-                Poll::Ready(Some(reply)) => self.reply(reply),
-                _ => break,
+        for path in [Path::Tunnel, Path::Direct] {
+            for i in 0..BATCH {
+                let replies = match path {
+                    Path::Tunnel => &mut self.tunnel_replies.rx,
+                    Path::Direct => &mut self.direct_replies.rx,
+                };
+                match replies.poll_recv(cx) {
+                    Poll::Ready(Some(reply)) => self.reply(path, reply),
+                    _ => break,
+                }
+                more |= i == BATCH - 1;
             }
-            more |= i == BATCH - 1;
         }
 
         // TCP: let `smoltcp` process and emit, move bytes, repeat while bytes move.
@@ -430,7 +479,7 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
     }
 
     /// A SYN to a new destination: a socket listening exactly there, and a request for the
-    /// handler. Over the limit, no socket: `smoltcp` answers the SYN with RST.
+    /// handler of its path. Over the limit, no socket: `smoltcp` answers the SYN with RST.
     fn accept(&mut self, src: SocketAddr, dst: SocketAddr) {
         if self.tcp.len() >= self.config.max_tcp {
             self.count(|c| &c.dropped, 1);
@@ -449,6 +498,7 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
             return;
         }
         let handle = self.sockets.add(socket);
+        let path = self.rules.path(dst);
         let (io, remote) = tokio::io::duplex(DUPLEX_BUFFER);
         self.tcp.insert(
             handle,
@@ -456,6 +506,7 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
                 io,
                 src,
                 dst,
+                path,
                 established: false,
                 io_shut: false,
                 io_eof: false,
@@ -463,18 +514,23 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
         );
         self.tuples.insert((src, dst), handle);
         if self.diag.verbose() {
-            log::debug!("TUN TCP {src} -> {dst}: open");
+            log::debug!("TUN TCP {src} -> {dst}: open, {path:?}");
         }
-        self.handler.tcp(TcpRequest {
+        let request = TcpRequest {
             dst: target(dst),
             io: Box::new(remote),
-        });
+        };
+        match path {
+            Path::Tunnel => self.tunnel.tcp(request),
+            Path::Direct => self.direct.tcp(request),
+        }
     }
 
     fn pump(&mut self, cx: &mut Context<'_>) -> bool {
         let mut progress = false;
         for (&handle, conn) in &mut self.tcp {
-            progress |= conn.pump(self.sockets.get_mut::<tcp::Socket>(handle), cx);
+            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+            progress |= conn.pump(socket, cx, &self.split);
         }
         progress
     }
@@ -505,22 +561,27 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
 
     fn udp_out(&mut self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) {
         let now = Instant::now();
+        let path = self.rules.path(dst);
+        let key = (src, path);
         let mut packet = UdpPacket {
             src,
             dst,
             payload: Bytes::copy_from_slice(payload),
         };
-        if let Some(flow) = self.udp.get_mut(&src) {
+        if let Some(flow) = self.udp.get_mut(&key) {
             flow.last = now;
             match flow.tx.try_send(packet) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.split.sent(path, payload.len());
+                    return;
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.count(|c| &c.dropped, 1);
                     return;
                 }
                 // The handler ended the flow: open a new one.
                 Err(mpsc::error::TrySendError::Closed(p)) => {
-                    self.udp.remove(&src);
+                    self.udp.remove(&key);
                     packet = p;
                 }
             }
@@ -533,20 +594,27 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
             return;
         }
         if self.diag.verbose() {
-            log::debug!("TUN UDP {src}: new flow, first to {dst}");
+            log::debug!("TUN UDP {src}: new {path:?} flow, first to {dst}");
         }
         let (tx, rx) = mpsc::channel(FLOW_QUEUE);
         let _ = tx.try_send(packet);
-        self.handler.udp(src, rx, self.replies_tx.clone());
-        self.udp.insert(src, Flow { tx, last: now });
+        self.split.sent(path, payload.len());
+        match path {
+            Path::Tunnel => self.tunnel.udp(src, rx, self.tunnel_replies.tx.clone()),
+            Path::Direct => self.direct.udp(src, rx, self.direct_replies.tx.clone()),
+        }
+        self.udp.insert(key, Flow { tx, last: now });
     }
 
-    fn reply(&mut self, reply: UdpPacket) {
-        if let Some(flow) = self.udp.get_mut(&reply.dst) {
+    fn reply(&mut self, path: Path, reply: UdpPacket) {
+        if let Some(flow) = self.udp.get_mut(&(reply.dst, path)) {
             flow.last = Instant::now();
         }
         match packet::udp(reply.src, reply.dst, &reply.payload, self.config.mtu) {
-            Some(packet) if self.phy.tx.len() < OUT_QUEUE => self.phy.tx.push_back(packet),
+            Some(packet) if self.phy.tx.len() < OUT_QUEUE => {
+                self.split.received(path, reply.payload.len());
+                self.phy.tx.push_back(packet);
+            }
             _ => self.count(|c| &c.dropped, 1),
         }
     }
@@ -555,10 +623,10 @@ impl<D: PacketDevice, H: Handler> Stack<D, H> {
     fn sweep(&mut self, now: Instant) {
         let idle = self.config.udp_idle;
         let verbose = self.diag.verbose();
-        self.udp.retain(|src, flow| {
+        self.udp.retain(|(src, path), flow| {
             let keep = now.duration_since(flow.last) < idle && !flow.tx.is_closed();
             if !keep && verbose {
-                log::debug!("TUN UDP {src}: flow closed");
+                log::debug!("TUN UDP {src}: {path:?} flow closed");
             }
             keep
         });

@@ -3,8 +3,9 @@
 //! The counterpart of `socks5` for platforms where the system hands over a TUN interface
 //! (Android `VpnService`, later desktop). TCP goes through a userspace `smoltcp` stack and
 //! comes out as [`TcpRequest`]s; UDP is parsed directly, one flow per source. Nothing listens
-//! on a local socket. Destinations are always IP addresses: names were resolved by the system
-//! before the packet reached the interface.
+//! on a local socket. [`Split`] rules send each connection and datagram either through the
+//! tunnel or [`Direct`]ly. Destinations are always IP addresses: names were resolved by the
+//! system before the packet reached the interface.
 //!
 //! `unsafe` is denied except for registering the fd with the reactor in `device`.
 
@@ -12,8 +13,10 @@
 
 mod device;
 mod diagnostics;
+mod direct;
 mod engine;
 mod packet;
+mod split;
 mod stack;
 
 use std::net::SocketAddr;
@@ -25,9 +28,12 @@ use tokio::sync::mpsc;
 
 pub use device::{FdDevice, PacketDevice};
 pub use diagnostics::{Diagnostics, StackMetrics};
+pub use direct::{Direct, Protect};
+pub use split::{IpNet, ParseNetError, Path, Split, SplitConfig, SplitMode, SplitStats};
 pub use stack::run;
 
-/// Where the stack hands what it takes off the interface; [`client_core::Engine`] in production.
+/// Where the stack hands what it takes off the interface: [`client_core::Engine`] for the
+/// tunnel, [`Direct`] for the rest.
 pub trait Handler: Send + Sync + 'static {
     /// A new TCP connection. Called on the stack task: must not block.
     fn tcp(&self, request: TcpRequest);
