@@ -37,6 +37,16 @@ tar -xzf partizan-<version>-server-linux-x86_64.tar.gz
 Опубликованные GitHub Releases не зависят от срока хранения артефактов Actions.
 При публикации создаётся тег `v<version>` на точной ревизии сборки. Существующий
 релиз не перезаписывается; для следующего релиза увеличьте версию в `Cargo.toml`.
+Например, после `v0.1.0` для исправлений используйте `0.1.1`. Обновите также
+`PKG_VERSION` в `packaging/openwrt/partizan/Makefile` и lock-файлы:
+
+```sh
+cargo metadata --format-version 1 > /dev/null
+cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null
+```
+
+Закоммитьте изменения и запустите **новый** workflow на обновлённой ветке.
+Повторный запуск старого workflow использует прежнюю ревизию и версию.
 Если тег уже существует на другой ревизии, публикация завершится ошибкой.
 Сначала создаётся draft со всеми файлами, затем он публикуется как latest.
 
