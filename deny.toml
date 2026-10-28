@@ -15,8 +15,13 @@ allow = [
     "Unicode-3.0",
 ]
 private = { ignore = true }
-# Mozilla's root store data.
-exceptions = [{ name = "webpki-roots", allow = ["CDLA-Permissive-2.0"] }]
+exceptions = [
+    # Mozilla's root store data.
+    { name = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+    # Userspace TCP/IP for the TUN source and its buffer crate; public-domain-equivalent.
+    { name = "smoltcp", allow = ["0BSD"] },
+    { name = "managed", allow = ["0BSD"] },
+]
 
 [bans]
 multiple-versions = "warn"

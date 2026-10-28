@@ -116,7 +116,8 @@ crates/
   socks5/           # источник трафика: SOCKS5 CONNECT + UDP ASSOCIATE
   server/           # bin: listenerы, auth, dialer, UDP NAT, маскировка, admin
   client-openwrt/   # bin: конфиг, CLI, сборка socks5 + client-core
-  # позже: client-ffi/ (UniFFI), tun/ (источник трафика из TUN)
+  tun/              # источник трафика: TUN fd → userspace TCP/IP (smoltcp) + UDP-потоки
+  # позже: client-ffi/ (UniFFI)
 packaging/openwrt/  # Makefile для SDK, init.d, uci-defaults
 tests/e2e/          # netns-сценарии с потерями и задержками
 ```

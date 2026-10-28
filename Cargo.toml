@@ -16,6 +16,7 @@ transport = { path = "crates/transport" }
 client-core = { path = "crates/client-core" }
 socks5 = { path = "crates/socks5" }
 server = { path = "crates/server" }
+tun = { path = "crates/tun" }
 bytes = "1"
 thiserror = "2"
 base64 = "0.22"
@@ -48,6 +49,8 @@ qrcode = { version = "0.14", default-features = false }
 log = "0.4"
 rustls-pki-types = { version = "1", features = ["std"] }
 socket2 = { version = "0.6", features = ["all"] }
+# Userspace TCP for the TUN source; UDP is parsed by hand, so no `socket-udp`.
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 
