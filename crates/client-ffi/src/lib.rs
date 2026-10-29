@@ -77,7 +77,7 @@ pub struct VpnStatus {
     pub state: VpnState,
     /// `quic` or `tls` while connected.
     pub transport: Option<String>,
-    /// Smoothed round-trip time while connected.
+    /// Smoothed round-trip time while connected, if the transport measures it (QUIC does).
     pub rtt_ms: Option<u32>,
     /// Payload bytes sent through the tunnel since start.
     pub tx_bytes: u64,
@@ -486,7 +486,9 @@ fn to_status(
     VpnStatus {
         state,
         transport: core.transport.filter(|_| connected).map(str::to_owned),
-        rtt_ms: connected.then(|| u32::try_from(core.stats.rtt.as_millis()).unwrap_or(u32::MAX)),
+        // TCP+TLS does not measure RTT and reports zero: unknown, not instant.
+        rtt_ms: (connected && !core.stats.rtt.is_zero())
+            .then(|| u32::try_from(core.stats.rtt.as_millis()).unwrap_or(u32::MAX)),
         tx_bytes: traffic.tunnel_sent,
         rx_bytes: traffic.tunnel_received,
         reconnects: core.reconnects,
@@ -533,6 +535,13 @@ mod tests {
         assert_eq!(
             (up.transport.as_deref(), up.rtt_ms),
             (Some("quic"), Some(42))
+        );
+        let mut tls = core(true, false);
+        tls.stats.rtt = Duration::ZERO;
+        assert_eq!(
+            to_status(&tls, true, None, &t).rtt_ms,
+            None,
+            "unmeasured RTT"
         );
         let down = to_status(&core(false, false), true, None, &t);
         assert_eq!((down.transport, down.rtt_ms), (None, None));
