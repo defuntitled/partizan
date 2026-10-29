@@ -9,6 +9,8 @@ permissions:
   contents: read
 
 env:
+  # The NDK the Android core is built and tested with (also ../partizan-ui).
+  ANDROID_NDK_VERSION: 28.2.13676358
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
@@ -114,10 +116,17 @@ jobs:
           distribution: temurin
           java-version: 21
       - run: cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Install the pinned NDK
+        # Not the runner's latest: NDK r30 rejects the unversioned clang target bindgen uses for
+        # BoringSSL ("Unversioned target triples are not supported"). This is the one tested.
+        run: |
+          ndk="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          if [[ ! -d "$ndk" ]]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
       - name: Build the AAR
-        # The runner's variable, expanded by the shell: `env.` in an expression sees only the
-        # workflow's own variables.
-        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh
+        run: scripts/build-android.sh
       - uses: actions/upload-artifact@v4
         with:
           name: partizan-core-aar
