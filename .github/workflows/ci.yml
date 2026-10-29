@@ -122,8 +122,12 @@ jobs:
         run: |
           ndk="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
           if [[ ! -d "$ndk" ]]; then
-            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" > /dev/null
+            # Answers from a process substitution, not a pipe: with pipefail a pipe from `yes`
+            # fails on SIGPIPE once sdkmanager is done. Output stays visible for diagnosis.
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" < <(yes)
           fi
+          test -f "$ndk/source.properties" || { echo "NDK $ANDROID_NDK_VERSION missing at $ndk" >&2; exit 1; }
+          grep Pkg.Revision "$ndk/source.properties"
           echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
       - name: Build the AAR
         run: scripts/build-android.sh
