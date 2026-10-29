@@ -8,6 +8,10 @@ on:
         description: Publish GitHub Release v<workspace version> for the installers
         type: boolean
         default: true
+      ui_ref:
+        description: Branch, tag or commit of partizan-ui to build the Android app from
+        type: string
+        default: main
 
 permissions:
   contents: read
@@ -112,20 +116,124 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  android:
+    name: Build the Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: partizan
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/partizan-ui
+          ref: ${{ inputs.ui_ref }}
+          path: partizan-ui
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential cmake clang libclang-dev pkg-config
+      - name: Load the pinned Rust toolchain (with aarch64-linux-android)
+        working-directory: partizan
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: partizan
+          key: release-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.8
+          channel: stable
+          cache: true
+      - name: Build the core AAR
+        working-directory: partizan
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh
+      - name: Load the release signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          # A debug-signed APK from CI has a fresh key every run: the next release could not
+          # update it. No key, no APK.
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "Secret ANDROID_KEYSTORE_BASE64 is not set; see the partizan-ui README, «Подпись релиза»." >&2
+            exit 1
+          fi
+          base64 --decode <<<"$KEYSTORE_BASE64" > "$RUNNER_TEMP/release.jks"
+      - name: Build the APK
+        working-directory: partizan-ui
+        env:
+          PARTIZAN_CORE: ${{ github.workspace }}/partizan
+          PARTIZAN_KEYSTORE: ${{ runner.temp }}/release.jks
+          PARTIZAN_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PARTIZAN_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PARTIZAN_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("../partizan/Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          IFS=. read -r major minor patch <<<"${version%%-*}"
+          # One release, one version code, growing with the version: 0.2.0 → 200.
+          code=$((major * 10000 + minor * 100 + patch))
+          scripts/core-aar.sh --no-build
+          flutter pub get
+          flutter build apk --release --target-platform android-arm64 \
+            --build-name "$version" --build-number "$code"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "$GITHUB_WORKSPACE/dist/partizan-$version-android-arm64.apk"
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/dist/UI_COMMIT"
+      - name: Verify the signature and the version
+        run: |
+          tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          apk=$(echo dist/*.apk)
+          "$tools/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/certs.txt"
+          cat "$RUNNER_TEMP/certs.txt"
+          if grep -q "CN=Android Debug" "$RUNNER_TEMP/certs.txt"; then
+            echo "The APK is debug-signed" >&2
+            exit 1
+          fi
+          "$tools/aapt2" dump badging "$apk" | head -n 1
+          {
+            echo '### Android APK'
+            printf 'partizan-ui commit: `%s`\n\n' "$(cat dist/UI_COMMIT)"
+            echo '```text'
+            grep 'SHA-256' "$RUNNER_TEMP/certs.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: |
+            dist/*.apk
+            dist/UI_COMMIT
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   archives:
     name: Assemble release archives
-    needs: binaries
+    needs: [binaries, android]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       version: ${{ steps.source.outputs.version }}
+      ui_commit: ${{ steps.ui.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: release-binary-*
+          pattern: release-*
           path: dist
           merge-multiple: true
+      - name: Keep the partizan-ui commit for the release notes
+        id: ui
+        run: |
+          printf 'commit=%s\n' "$(cat dist/UI_COMMIT)" >> "$GITHUB_OUTPUT"
+          rm dist/UI_COMMIT
       - name: Archive the matching source revision
         id: source
         run: |
@@ -153,7 +261,9 @@ jobs:
         run: |
           archives=(*.tar.gz)
           test "${#archives[@]}" -eq 5
-          sha256sum "${archives[@]}" > SHA256SUMS
+          apks=(*.apk)
+          test "${#apks[@]}" -eq 1
+          sha256sum "${archives[@]}" "${apks[@]}" > SHA256SUMS
           sha256sum --check SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
@@ -185,6 +295,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_VERSION: ${{ needs.archives.outputs.version }}
+      UI_COMMIT: ${{ needs.archives.outputs.ui_commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -206,9 +317,9 @@ jobs:
             echo "Release $tag already exists. Bump the workspace version; existing assets are never overwritten." >&2
             exit 1
           fi
-          printf 'Static Linux x86_64 server/client, ARMv8 OpenWrt client, source and interactive installers.\n\nCommit: `%s`\n\nVerify downloads with `sha256sum --check SHA256SUMS`.\n' \
-            "$GITHUB_SHA" > "$RUNNER_TEMP/release-notes.md"
-          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS \
+          printf 'Static Linux x86_64 server/client, ARMv8 OpenWrt client, Android app (arm64, Android 8.0+), source and interactive installers.\n\nCommit: `%s`\nAndroid app from partizan-ui commit: `%s`\n\nVerify downloads with `sha256sum --check SHA256SUMS`.\n' \
+            "$GITHUB_SHA" "$UI_COMMIT" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$tag" dist/*.tar.gz dist/*.apk dist/SHA256SUMS \
             --draft --target "$GITHUB_SHA" --title "partizan $tag" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
           gh release edit "$tag" --draft=false --latest
