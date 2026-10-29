@@ -1,0 +1,29 @@
+[package]
+name = "client-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+# `cdylib` for the platforms, `lib` for the Rust tests.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+client-core.workspace = true
+libc.workspace = true
+log.workspace = true
+proto.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+transport.workspace = true
+tun.workspace = true
+uniffi.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+server.workspace = true

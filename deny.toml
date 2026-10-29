@@ -3,6 +3,11 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # basic-toml is unmaintained (no vulnerability); askama reads its config with it while
+    # uniffi-bindgen generates the Kotlin bindings. Build-time only, not in the libraries.
+    { id = "RUSTSEC-2026-0374", reason = "build-time only, via uniffi_bindgen -> askama" },
+]
 
 [licenses]
 allow = [
@@ -21,6 +26,15 @@ exceptions = [
     # Userspace TCP/IP for the TUN source and its buffer crate; public-domain-equivalent.
     { name = "smoltcp", allow = ["0BSD"] },
     { name = "managed", allow = ["0BSD"] },
+    # UniFFI, for the mobile bindings: file-level copyleft, compatible with AGPL (MPL 2.0 §3.3).
+    { name = "uniffi", allow = ["MPL-2.0"] },
+    { name = "uniffi_bindgen", allow = ["MPL-2.0"] },
+    { name = "uniffi_core", allow = ["MPL-2.0"] },
+    { name = "uniffi_internal_macros", allow = ["MPL-2.0"] },
+    { name = "uniffi_macros", allow = ["MPL-2.0"] },
+    { name = "uniffi_meta", allow = ["MPL-2.0"] },
+    { name = "uniffi_pipeline", allow = ["MPL-2.0"] },
+    { name = "uniffi_udl", allow = ["MPL-2.0"] },
 ]
 
 [bans]

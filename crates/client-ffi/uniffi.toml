@@ -1,0 +1,3 @@
+# Read by `uniffi-bindgen` when it generates the bindings.
+[bindings.kotlin]
+package_name = "partizan.core"

@@ -177,3 +177,39 @@ async fn rebind_keeps_the_session() {
     );
     assert_eq!(state.sessions.len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a03_t4_shutdown_closes_the_session_and_stops_for_good() {
+    let f = fixture();
+    let (addr, state, _endpoint) = start_server(&f, "127.0.0.1:0".parse().unwrap()).await;
+    let echo = tcp_echo().await;
+    let engine = engine(&f, addr);
+    engine.start();
+    let (mut send, mut recv) = engine.open_tcp(target(echo), true).await.unwrap();
+    send.write_all(b"x").await.unwrap();
+    let mut buf = [0u8; 1];
+    recv.read_exact(&mut buf).await.unwrap();
+    assert_eq!(state.sessions.len(), 1);
+
+    let started = Instant::now();
+    engine.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown is quick"
+    );
+    assert!(!engine.status().await.connected);
+    assert!(
+        eventually(Duration::from_secs(3), async || state.sessions.is_empty()).await,
+        "the server saw the session close"
+    );
+    // The open stream ended with the session.
+    assert!(matches!(recv.read(&mut buf).await, Ok(0) | Err(_)));
+    assert!(matches!(
+        engine.open_tcp(target(echo), true).await,
+        Err(ConnectError::Session(EngineError::Stopped))
+    ));
+    // No reconnect behind our back, and starting again does nothing.
+    engine.start();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(state.sessions.is_empty());
+}

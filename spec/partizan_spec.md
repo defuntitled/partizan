@@ -117,7 +117,8 @@ crates/
   server/           # bin: listenerы, auth, dialer, UDP NAT, маскировка, admin
   client-openwrt/   # bin: конфиг, CLI, сборка socks5 + client-core
   tun/              # источник трафика: TUN fd → userspace TCP/IP (smoltcp) + UDP-потоки
-  # позже: client-ffi/ (UniFFI)
+  client-ffi/       # фасад для мобильных платформ (UniFFI): start/stop/status/check_uri
+  uniffi-bindgen/   # bin: генерация Kotlin-биндингов для client-ffi
 packaging/openwrt/  # Makefile для SDK, init.d, uci-defaults
 tests/e2e/          # netns-сценарии с потерями и задержками
 ```

@@ -1,7 +1,8 @@
 //! The session with the server: QUIC connection, auth exchange, shared by all streams.
 //!
 //! With [`Engine::start`] a supervisor keeps the session up: it reconnects with exponential
-//! backoff and jitter, obeys `GoAway`, and stops for good when the device is revoked.
+//! backoff and jitter, obeys `GoAway`, and stops for good when the device is revoked or the
+//! engine is shut down.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -37,6 +38,8 @@ const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Longest `retry_after_ms` honoured from a `GoAway`.
 const RETRY_AFTER_MAX: Duration = Duration::from_secs(600);
+/// On shutdown, how long the QUIC endpoint gets to send its close.
+const CLOSE_GRACE: Duration = Duration::from_millis(500);
 
 /// What the engine needs to reach the server.
 #[derive(Debug, Clone)]
@@ -74,6 +77,9 @@ pub enum EngineError {
     /// No session within [`SESSION_WAIT`].
     #[error("no session to the server")]
     Unavailable,
+    /// The engine was shut down.
+    #[error("engine stopped")]
+    Stopped,
 }
 
 /// Session snapshot for `status`.
@@ -170,7 +176,9 @@ pub(crate) struct Inner {
     pub(crate) current: watch::Sender<Option<Arc<Session>>>,
     connecting: Mutex<()>,
     supervised: AtomicBool,
+    supervisor: std::sync::Mutex<Option<AbortHandle>>,
     revoked: AtomicBool,
+    stopped: AtomicBool,
     demand: Notify,
     pub(crate) udp: Arc<UdpRegistry>,
     pub(crate) tcp_streams: AtomicUsize,
@@ -188,7 +196,9 @@ impl Engine {
                 current: watch::Sender::new(None),
                 connecting: Mutex::new(()),
                 supervised: AtomicBool::new(false),
+                supervisor: std::sync::Mutex::new(None),
                 revoked: AtomicBool::new(false),
+                stopped: AtomicBool::new(false),
                 demand: Notify::new(),
                 udp: Arc::new(UdpRegistry::default()),
                 tcp_streams: AtomicUsize::new(0),
@@ -200,9 +210,40 @@ impl Engine {
 
     /// Keeps a session up in the background from now on (the daemon mode).
     pub fn start(&self) {
-        if !self.inner.supervised.swap(true, Ordering::AcqRel) {
-            tokio::spawn(supervise(self.clone()));
+        if self.inner.stopped.load(Ordering::Acquire) {
+            return;
         }
+        if !self.inner.supervised.swap(true, Ordering::AcqRel) {
+            let task = tokio::spawn(supervise(self.clone())).abort_handle();
+            *self
+                .inner
+                .supervisor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(task);
+        }
+    }
+
+    /// Stops for good: no more reconnects, the session is closed and every stream and flow on
+    /// it ends. New connections fail with [`EngineError::Stopped`].
+    pub async fn shutdown(&self) {
+        self.inner.stopped.store(true, Ordering::Release);
+        let supervisor = self
+            .inner
+            .supervisor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(task) = supervisor {
+            task.abort();
+        }
+        if let Some(session) = self.inner.current.send_replace(None) {
+            session.transport.close(ErrorCode::NO_ERROR, b"shutdown");
+            if let Some(endpoint) = &session.endpoint {
+                let _ = tokio::time::timeout(CLOSE_GRACE, endpoint.wait_idle()).await;
+            }
+        }
+        // Wakes callers waiting for a session.
+        self.inner.current.send_replace(None);
     }
 
     /// One session now, without the supervisor (for `check`).
@@ -232,6 +273,9 @@ impl Engine {
     /// The live session. Under the supervisor, waits up to [`SESSION_WAIT`] for one; without
     /// it, connects inline (concurrent callers share the attempt).
     pub(crate) async fn session(&self) -> Result<Arc<Session>, EngineError> {
+        if self.inner.stopped.load(Ordering::Acquire) {
+            return Err(EngineError::Stopped);
+        }
         if self.inner.revoked.load(Ordering::Acquire) {
             return Err(EngineError::Revoked);
         }
@@ -244,6 +288,10 @@ impl Engine {
                 return Ok(session);
             }
             let session = Arc::new(establish(self).await?);
+            if self.inner.stopped.load(Ordering::Acquire) {
+                session.transport.close(ErrorCode::NO_ERROR, b"shutdown");
+                return Err(EngineError::Stopped);
+            }
             self.publish(session.clone());
             return Ok(session);
         }
@@ -251,6 +299,9 @@ impl Engine {
         let mut rx = self.inner.current.subscribe();
         let wait = async {
             loop {
+                if self.inner.stopped.load(Ordering::Acquire) {
+                    return Err(EngineError::Stopped);
+                }
                 if self.inner.revoked.load(Ordering::Acquire) {
                     return Err(EngineError::Revoked);
                 }

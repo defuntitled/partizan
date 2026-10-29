@@ -55,6 +55,8 @@ scripts/check-size.sh target/aarch64-unknown-linux-musl/release-client/partizan 
 
 The client's TCP+TLS runs on BoringSSL (`transport` feature `chrome`, pulled in by `client-core`): building needs cmake, a C/C++ compiler and libclang. If bindgen cannot find `stddef.h`, set `LIBCLANG_PATH` and `BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/<ver>/include`; cross builds also need `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl` pointing at zig's musl headers (see the CI `cross` job). The Chrome profile and its expected JA4 live in `crates/transport/src/chrome.rs`; the JA4 test fails when they drift.
 
+Android library (A04): `scripts/build-android.sh` builds `client-ffi` for `aarch64-linux-android` with `cargo-ndk` (`release-ffi` profile: size-optimized but panics unwind, so UniFFI raises them as exceptions) and packs `target/android/partizan-core.aar` without Gradle. It needs `ANDROID_NDK_HOME` and `cargo install cargo-ndk --version 4.1.2`. `scripts/ffi-kotlin-test.sh` runs the JVM test of the Kotlin bindings (A03). Both fetch `kotlinc` and JNA into `target/tools` (pinned SHA-256). Bindings are generated from the host build: stripped libraries carry no UniFFI metadata.
+
 Size flags (`lto`, `panic = "abort"`, …) live in the `release-client` profile, not `release`, because Cargo can't set them per package.
 
 Toolchain pinned in `rust-toolchain.toml`. Targets: `aarch64-unknown-linux-musl` (router, Routerich AX3000 / OpenWrt 24.10 `mediatek/filogic`) and `x86_64-unknown-linux-musl` (server), cross-built with `cargo-zigbuild`.
