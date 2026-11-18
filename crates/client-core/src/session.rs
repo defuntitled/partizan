@@ -342,7 +342,7 @@ impl Engine {
         };
         let t = s.transport.stats();
         serde_json::json!({"configured":format!("{:?}",self.inner.config.uri.transport).to_lowercase(),"sid":format!("{:016x}",s.info.sid),"transport":s.kind,"tx_bytes":t.bytes_sent,
-            "rx_bytes":t.bytes_received,"rtt_us":(!t.rtt.is_zero()).then(||t.rtt.as_micros() as u64),
+            "rx_bytes":t.bytes_received,"rtt_us":(!t.rtt.is_zero()).then_some(t.rtt.as_micros() as u64),
             "udp_drops":self.inner.udp.drops.load(Ordering::Relaxed),"path":s.transport.diagnostics()})
     }
 

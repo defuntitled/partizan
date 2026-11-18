@@ -80,7 +80,7 @@ fn handle(command: &str, state: &State, info: Info) -> String {
             let rows: Vec<_> = state.sessions.list().into_iter().map(|(sid,s)| {
                 let stats=s.connection.stats();
                 serde_json::json!({"sid":format!("{sid:016x}"),"transport":s.transport,
-                    "rtt_us":(!stats.rtt.is_zero()).then(||stats.rtt.as_micros() as u64),
+                    "rtt_us":(!stats.rtt.is_zero()).then_some(stats.rtt.as_micros() as u64),
                     "tx_bytes":stats.bytes_sent,"rx_bytes":stats.bytes_received,"path":s.connection.diagnostics()})
             }).collect();
             let utc_ms = std::time::SystemTime::now()

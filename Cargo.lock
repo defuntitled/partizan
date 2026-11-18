@@ -396,7 +396,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "client-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "client-ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "client-core",
  "libc",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "client-openwrt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "client-core",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -1975,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "socks5"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "client-core",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "boring",
@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "tun"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "client-core",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "uniffi",
 ]
