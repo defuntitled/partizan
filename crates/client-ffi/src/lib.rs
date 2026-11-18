@@ -15,6 +15,7 @@ use proto::auth::{ClientInfo, ConnectionUri, TransportMode};
 use transport::QuicConfig;
 use tun::{Diagnostics, Direct, FdDevice, IpNet, Split};
 
+mod journal;
 uniffi::setup_scaffolding!();
 
 /// How often the status is refreshed and, if changed, sent to the listener.
@@ -373,7 +374,34 @@ pub fn check_uri(uri: String) -> Result<CheckResult, VpnError> {
 /// Switches stack profiling and the verbose stack log on the fly, running or not.
 #[uniffi::export]
 pub fn set_diagnostics(profiling: bool, verbose_log: bool) {
+    journal::configure(profiling, verbose_log);
     DIAGNOSTICS.set(profiling, verbose_log);
+}
+
+/// Consumed by the Android service once a second while recording.
+#[uniffi::export]
+pub fn diagnostic_sample() -> String {
+    use serde_json::json;
+    if !DIAGNOSTICS.profiling() {
+        return "{}".into();
+    }
+    let m = DIAGNOSTICS.metrics();
+    let vpn = lock(&VPN);
+    let traffic = vpn
+        .as_ref()
+        .map(|r| r.shared.split.stats())
+        .unwrap_or_default();
+    json!({
+        "core_version":env!("CARGO_PKG_VERSION"),
+        "session":vpn.as_ref().map(|r|r.engine.diagnostics()),
+        "tunnel_tx":traffic.tunnel_sent,"tunnel_rx":traffic.tunnel_received,
+        "direct_tx":traffic.direct_sent,"direct_rx":traffic.direct_received,
+        "tun_in_bytes":m.bytes_in,"tun_out_bytes":m.bytes_out,
+        "packets_in":m.packets_in,"packets_out":m.packets_out,"dropped":m.dropped,
+        "queue":m.queue_depth,"queue_peak":m.queue_peak,"tcp":m.tcp_connections,
+        "udp":m.udp_flows,"stack_us":m.stack_time.as_micros() as u64,"io_us":m.io_time.as_micros() as u64,
+        "packet_buckets":DIAGNOSTICS.packet_histogram(),"journal":journal::drain()
+    }).to_string()
 }
 
 /// Stack counters for the diagnostics screen.

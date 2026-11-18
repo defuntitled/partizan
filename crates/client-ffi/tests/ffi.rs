@@ -290,6 +290,10 @@ fn a03_t2_t3_start_connects_reports_transitions_and_carries_traffic() {
     assert_eq!(status.transport.as_deref(), Some("quic"));
     assert!(status.rtt_ms.is_some());
 
+    capture_logs();
+    assert_eq!(client_ffi::diagnostic_sample(), "{}");
+    client_ffi::set_diagnostics(true, true);
+
     // A datagram written to the "TUN fd" reaches the echo through the server and comes back.
     let SocketAddr::V4(echo) = echo else {
         unreachable!()
@@ -308,6 +312,22 @@ fn a03_t2_t3_start_connects_reports_transitions_and_carries_traffic() {
         let s = client_ffi::status();
         s.tx_bytes >= 7 && s.rx_bytes >= 7
     }));
+
+    let sample = client_ffi::diagnostic_sample();
+    let d: serde_json::Value = serde_json::from_str(&sample).unwrap();
+    assert!(d["session"]["path"]["cwnd_bytes"].as_u64().unwrap() > 0);
+    assert!(d["session"]["sid"].as_str().is_some());
+    assert!(d["tun_in_bytes"].as_u64().unwrap() >= 7);
+    for private in [
+        token_text(&server.uri(TransportMode::Quic)),
+        echo.to_string(),
+        app.to_string(),
+        "through".into(),
+    ] {
+        assert!(!sample.contains(&private));
+    }
+    client_ffi::set_diagnostics(false, false);
+    assert_eq!(client_ffi::diagnostic_sample(), "{}");
 
     // A03-T3: the listener saw the way up.
     let states = listener.states();

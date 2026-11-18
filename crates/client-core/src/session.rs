@@ -335,6 +335,17 @@ impl Engine {
         Ok(())
     }
 
+    /// A snapshot of one session, with the server's correlation ID and no peer addresses.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        let Some(s) = self.live() else {
+            return serde_json::Value::Null;
+        };
+        let t = s.transport.stats();
+        serde_json::json!({"configured":format!("{:?}",self.inner.config.uri.transport).to_lowercase(),"sid":format!("{:016x}",s.info.sid),"transport":s.kind,"tx_bytes":t.bytes_sent,
+            "rx_bytes":t.bytes_received,"rtt_us":(!t.rtt.is_zero()).then(||t.rtt.as_micros() as u64),
+            "udp_drops":self.inner.udp.drops.load(Ordering::Relaxed),"path":s.transport.diagnostics()})
+    }
+
     /// Current state.
     pub async fn status(&self) -> Status {
         let live = self.live();
@@ -381,7 +392,8 @@ async fn supervise(engine: Engine) {
                         () = probe => {
                             match establish_quic(&inner.config, inner.udp.clone()).await {
                                 Ok(quic) => {
-                                    log::info!("QUIC works again; switching back from TCP+TLS");
+                                    log::info!(target: "partizan_diag", "quic_restored");
+                    log::info!("QUIC works again; switching back from TCP+TLS");
                                     *inner.tls_until.lock().unwrap_or_else(|e| e.into_inner()) = None;
                                     let old = std::mem::replace(&mut session, Arc::new(quic));
                                     engine.publish(session.clone());
@@ -392,7 +404,8 @@ async fn supervise(engine: Engine) {
                                     });
                                 }
                                 Err(e) => {
-                                    log::debug!("QUIC probe failed: {e}");
+                                    log::info!(target: "partizan_diag", "quic_probe_failed");
+                    log::debug!("QUIC probe failed: {e}");
                                     engine.remember_tls();
                                 }
                             }
@@ -410,6 +423,7 @@ async fn supervise(engine: Engine) {
                 drop(session);
                 match end {
                     End::Revoked => {
+                        log::info!(target: "partizan_diag", "revoked");
                         log::error!("the server revoked this device; not reconnecting");
                         inner.revoked.store(true, Ordering::Release);
                         inner.current.send_replace(None);
@@ -424,15 +438,28 @@ async fn supervise(engine: Engine) {
                         continue;
                     }
                     End::Idle => {
+                        log::info!(target: "partizan_diag", "idle");
                         log::info!("session idle; reconnecting on demand");
                         inner.demand.notified().await;
                         continue;
                     }
-                    End::Lost(reason) => log::warn!("session lost: {reason}"),
+                    End::Lost(reason) => {
+                        log::warn!(target:"partizan_diag","session_lost");
+                        log::warn!("session lost: {reason}");
+                    }
                 }
             }
             Err(e) => {
                 failures = failures.saturating_add(1);
+                let category = match &e {
+                    EngineError::Resolve(_) => "dns",
+                    EngineError::Connect(_) => "transport",
+                    EngineError::Handshake(_) => "handshake",
+                    EngineError::Unavailable => "unavailable",
+                    EngineError::Revoked => "revoked",
+                    EngineError::Stopped => "stopped",
+                };
+                log::info!(target: "partizan_diag", "connect_failed attempt={failures} category={category}");
                 log::warn!("connecting failed (attempt {failures}): {e}");
             }
         }
@@ -466,6 +493,7 @@ async fn establish(engine: &Engine) -> Result<Session, EngineError> {
                 // Only a transport failure says QUIC is blocked; a rejection would repeat on TCP.
                 Err(e @ EngineError::Handshake(_)) => Err(e),
                 Err(e) => {
+                    log::info!(target: "partizan_diag", "fallback_tls");
                     log::warn!("QUIC failed ({e}); falling back to TCP+TLS");
                     engine.remember_tls();
                     establish_tls(config, udp).await
@@ -585,6 +613,7 @@ async fn establish_quic(
     let (established, h3_control, send, recv) = tokio::time::timeout(HANDSHAKE_TIMEOUT, auth)
         .await
         .map_err(|_| EngineError::Handshake(HandshakeError::Timeout))??;
+    log::info!(target:"partizan_diag","session_up transport=QUIC setup_ms={}",started.elapsed().as_millis());
     log::info!(
         "session up via QUIC to {addr} in {} ms",
         started.elapsed().as_millis()
@@ -641,11 +670,18 @@ async fn establish_tls(
     let established = tokio::time::timeout(HANDSHAKE_TIMEOUT, auth)
         .await
         .map_err(|_| EngineError::Handshake(HandshakeError::Timeout))??;
+    log::info!(target:"partizan_diag","session_up transport=TCP+TLS setup_ms={}",started.elapsed().as_millis());
     log::info!(
         "session up via TCP+TLS to {addr} in {} ms",
         started.elapsed().as_millis()
     );
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let socket = std::os::fd::AsFd::as_fd(stream.get_ref())
+        .try_clone_to_owned()
+        .ok();
     let mux = MuxTransport::new(stream, Role::Client, &established.leftover);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mux = mux.with_socket(socket);
     Ok(start_session(
         Arc::new(mux.clone()),
         Arc::new(mux),

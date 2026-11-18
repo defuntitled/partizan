@@ -104,6 +104,10 @@ pub trait Transport: Send + Sync {
     async fn recv_datagram(&self) -> Result<Bytes, TransportError>;
     /// Largest datagram the path takes now, `None` if datagrams are unavailable.
     fn max_datagram_size(&self) -> Option<usize>;
+    /// On-demand, address-free diagnostics. Only collected at the request of a reader.
+    fn diagnostics(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
     /// Current counters.
     fn stats(&self) -> TransportStats;
     /// Closes the connection with an application error code.

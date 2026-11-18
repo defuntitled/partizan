@@ -121,6 +121,15 @@ impl Diagnostics {
         self.verbose.load(Ordering::Relaxed)
     }
 
+    /// Cumulative log2 nanosecond bucket counts. Readers subtract adjacent samples.
+    pub fn packet_histogram(&self) -> Vec<u64> {
+        self.counters
+            .packet_time
+            .iter()
+            .map(|n| n.load(Ordering::Relaxed))
+            .collect()
+    }
+
     /// Current metrics; all zero while profiling is off.
     pub fn metrics(&self) -> StackMetrics {
         if !self.profiling() {

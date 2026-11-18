@@ -15,7 +15,7 @@ usage: partizan-server run [--config PATH]
        partizan-server device rotate ID|NAME [--host HOST] [--config PATH]
        partizan-server device revoke ID|NAME [--config PATH]
        partizan-server device list [--config PATH]
-       partizan-server session list [--config PATH]
+       partizan-server session list|diagnostics [--config PATH]
        partizan-server version";
 const DEFAULT_CONFIG: &str = "/etc/partizan/server.toml";
 
@@ -59,6 +59,7 @@ fn parse_args() -> Result<Command, String> {
         },
         ["device", "revoke", key] => cli::Action::Revoke { key: (*key).into() },
         ["device", "list"] => cli::Action::List,
+        ["session", "diagnostics"] => cli::Action::Diagnostics,
         ["session", "list"] => cli::Action::Sessions,
         _ => return Err(USAGE.into()),
     };

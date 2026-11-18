@@ -19,6 +19,8 @@ chrome = [
 ]
 
 [dependencies]
+log.workspace = true
+serde_json.workspace = true
 async-trait.workspace = true
 boring = { workspace = true, optional = true }
 boring-sys = { workspace = true, optional = true }
@@ -40,6 +42,10 @@ tokio.workspace = true
 tokio-boring = { workspace = true, optional = true }
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc.workspace = true
+linux-raw-sys = { version = "0.12", features = ["net"] }
 
 [dev-dependencies]
 rcgen.workspace = true

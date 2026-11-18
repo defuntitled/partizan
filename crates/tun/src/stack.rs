@@ -82,6 +82,8 @@ struct Stack<D, T, R> {
     iface: Interface,
     sockets: SocketSet<'static>,
     phy: Phy,
+    next_id: u64,
+    dns: HashMap<(SocketAddr, SocketAddr, u16), Instant>,
     tcp: HashMap<SocketHandle, Conn>,
     /// `(source, destination)` of every connection, so a retransmitted SYN opens nothing new.
     tuples: HashMap<(SocketAddr, SocketAddr), SocketHandle>,
@@ -156,6 +158,10 @@ impl Device for Phy {
 
 /// One TCP connection: its socket's handle is the key in `Stack::tcp`.
 struct Conn {
+    id: u64,
+    up: u64,
+    down: u64,
+    blocked: Option<Instant>,
     /// Our end of the stream handed to the handler.
     io: DuplexStream,
     src: SocketAddr,
@@ -179,7 +185,13 @@ enum Step {
 
 impl Conn {
     /// Moves what can be moved both ways; `true` if anything changed.
-    fn pump(&mut self, socket: &mut tcp::Socket<'_>, cx: &mut Context<'_>, split: &Split) -> bool {
+    fn pump(
+        &mut self,
+        socket: &mut tcp::Socket<'_>,
+        cx: &mut Context<'_>,
+        split: &Split,
+        verbose: bool,
+    ) -> bool {
         use tcp::State;
         if !matches!(
             socket.state(),
@@ -198,10 +210,19 @@ impl Conn {
             });
             match step {
                 Ok(Step::Moved(n)) => {
+                    if verbose {
+                        self.up += n as u64;
+                    }
+                    self.blocked = None;
                     split.sent(self.path, n);
                     progress = true;
                 }
-                Ok(Step::Pending) => break,
+                Ok(Step::Pending) => {
+                    if verbose {
+                        self.blocked.get_or_insert_with(Instant::now);
+                    }
+                    break;
+                }
                 _ => {
                     socket.abort();
                     return true;
@@ -234,6 +255,9 @@ impl Conn {
             });
             match step {
                 Ok(Step::Moved(n)) => {
+                    if verbose {
+                        self.down += n as u64;
+                    }
                     split.received(self.path, n);
                     progress = true;
                 }
@@ -302,6 +326,8 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
             iface,
             sockets: SocketSet::new(Vec::new()),
             phy,
+            next_id: 0,
+            dns: HashMap::new(),
             tcp: HashMap::new(),
             tuples: HashMap::new(),
             udp: HashMap::new(),
@@ -408,6 +434,9 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
                         Err(e) => {
                             self.count(|c| &c.dropped, 1);
                             log::debug!("TUN write failed: {e}");
+                            if self.profiling {
+                                log::info!(target:"partizan_diag","tun_write_failed");
+                            }
                         }
                     }
                 }
@@ -463,6 +492,9 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
     fn inbound(&mut self, packet: &[u8]) {
         match packet::parse(packet) {
             Err(reject) => {
+                if self.profiling {
+                    log::info!(target:"partizan_diag","packet_{reject:?}");
+                }
                 self.count(|c| &c.dropped, 1);
                 if self.diag.verbose() {
                     log::debug!("TUN packet dropped: {reject:?}");
@@ -482,6 +514,9 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
     /// handler of its path. Over the limit, no socket: `smoltcp` answers the SYN with RST.
     fn accept(&mut self, src: SocketAddr, dst: SocketAddr) {
         if self.tcp.len() >= self.config.max_tcp {
+            if self.profiling {
+                log::info!(target:"partizan_diag","tcp_limit");
+            }
             self.count(|c| &c.dropped, 1);
             if self.diag.verbose() {
                 log::debug!("TUN TCP {src} -> {dst}: connection limit");
@@ -500,9 +535,14 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
         let handle = self.sockets.add(socket);
         let path = self.rules.path(dst);
         let (io, remote) = tokio::io::duplex(DUPLEX_BUFFER);
+        self.next_id += 1;
         self.tcp.insert(
             handle,
             Conn {
+                id: self.next_id,
+                up: 0,
+                down: 0,
+                blocked: None,
                 io,
                 src,
                 dst,
@@ -514,6 +554,7 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
         );
         self.tuples.insert((src, dst), handle);
         if self.diag.verbose() {
+            log::debug!(target:"partizan_diag","tcp_open id={} path={path:?}",self.next_id);
             log::debug!("TUN TCP {src} -> {dst}: open, {path:?}");
         }
         let request = TcpRequest {
@@ -530,7 +571,7 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
         let mut progress = false;
         for (&handle, conn) in &mut self.tcp {
             let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-            progress |= conn.pump(socket, cx, &self.split);
+            progress |= conn.pump(socket, cx, &self.split, self.diag.verbose());
         }
         progress
     }
@@ -553,6 +594,7 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
             if let Some(conn) = self.tcp.remove(&handle) {
                 self.tuples.remove(&(conn.src, conn.dst));
                 if self.diag.verbose() {
+                    log::debug!(target:"partizan_diag","tcp_close id={} tx={} rx={}",conn.id,conn.up,conn.down);
                     log::debug!("TUN TCP {} -> {}: closed", conn.src, conn.dst);
                 }
             }
@@ -562,6 +604,16 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
     fn udp_out(&mut self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) {
         let now = Instant::now();
         let path = self.rules.path(dst);
+        if self.profiling
+            && dst.port() == 53
+            && payload.len() >= 12
+            && payload[2] & 0x80 == 0
+            && self.dns.len() < 2048
+        {
+            self.dns
+                .entry((src, dst, u16::from_be_bytes([payload[0], payload[1]])))
+                .or_insert(now);
+        }
         let key = (src, path);
         let mut packet = UdpPacket {
             src,
@@ -576,6 +628,9 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
                     return;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    if self.profiling {
+                        log::info!(target:"partizan_diag","udp_queue_full");
+                    }
                     self.count(|c| &c.dropped, 1);
                     return;
                 }
@@ -587,6 +642,9 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
             }
         }
         if self.udp.len() >= self.config.max_udp {
+            if self.profiling {
+                log::info!(target:"partizan_diag","udp_limit");
+            }
             self.count(|c| &c.dropped, 1);
             if self.diag.verbose() {
                 log::debug!("TUN UDP {src} -> {dst}: flow limit");
@@ -607,6 +665,18 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
     }
 
     fn reply(&mut self, path: Path, reply: UdpPacket) {
+        if self.profiling
+            && reply.src.port() == 53
+            && reply.payload.len() >= 12
+            && reply.payload[2] & 0x80 != 0
+            && let Some(started) = self.dns.remove(&(
+                reply.dst,
+                reply.src,
+                u16::from_be_bytes([reply.payload[0], reply.payload[1]]),
+            ))
+        {
+            log::info!(target:"partizan_diag","dns_reply ms={} rcode={}",started.elapsed().as_millis(),reply.payload[3]&15);
+        }
         if let Some(flow) = self.udp.get_mut(&(reply.dst, path)) {
             flow.last = Instant::now();
         }
@@ -623,6 +693,23 @@ impl<D: PacketDevice, T: Handler, R: Handler> Stack<D, T, R> {
     fn sweep(&mut self, now: Instant) {
         let idle = self.config.udp_idle;
         let verbose = self.diag.verbose();
+        if self.profiling {
+            self.dns.retain(|_, started| {
+                let expired = now.duration_since(*started) >= Duration::from_secs(15);
+                if expired {
+                    log::info!(target:"partizan_diag","dns_timeout");
+                }
+                !expired
+            });
+        } else {
+            self.dns.clear();
+        }
+        if verbose {
+            for c in self.tcp.values() {
+                log::debug!(target:"partizan_diag","tcp_progress id={} tx={} rx={} blocked_ms={}",
+                    c.id,c.up,c.down,c.blocked.map_or(0,|t| t.elapsed().as_millis()));
+            }
+        }
         self.udp.retain(|(src, path), flow| {
             let keep = now.duration_since(flow.last) < idle && !flow.tx.is_closed();
             if !keep && verbose {

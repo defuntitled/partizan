@@ -76,6 +76,19 @@ fn handle(command: &str, state: &State, info: Info) -> String {
             let kicked = state.sessions.go_away(Some(id), ErrorCode::REVOKED, 0);
             format!("ok {kicked} sessions closed\n")
         }
+        (Some("diagnostics"), None) => {
+            let rows: Vec<_> = state.sessions.list().into_iter().map(|(sid,s)| {
+                let stats=s.connection.stats();
+                serde_json::json!({"sid":format!("{sid:016x}"),"transport":s.transport,
+                    "rtt_us":(!stats.rtt.is_zero()).then(||stats.rtt.as_micros() as u64),
+                    "tx_bytes":stats.bytes_sent,"rx_bytes":stats.bytes_received,"path":s.connection.diagnostics()})
+            }).collect();
+            let utc_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            format!("{}\n", serde_json::json!({"utc_ms":utc_ms,"sessions":rows}))
+        }
         (Some("sessions"), None) => sessions(state),
         (Some("info"), None) => format!(
             "pin={} port={}\n",

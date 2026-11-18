@@ -11,6 +11,7 @@ name = "partizan-server"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
 bytes.workspace = true
 getrandom.workspace = true
 hickory-resolver.workspace = true

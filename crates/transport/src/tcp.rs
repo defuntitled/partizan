@@ -54,6 +54,7 @@ struct State {
     closing: bool,
     bytes_sent: u64,
     bytes_received: u64,
+    write_started: Option<std::time::Instant>,
 }
 
 struct Shared {
@@ -143,6 +144,8 @@ fn dispatch(st: &mut State) {
 /// [`Transport`] over one TLS connection with the mux.
 #[derive(Clone)]
 pub struct MuxTransport {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    socket: Option<Arc<std::os::fd::OwnedFd>>,
     shared: Arc<Shared>,
 }
 
@@ -170,6 +173,7 @@ impl MuxTransport {
                 closing: false,
                 bytes_sent: 0,
                 bytes_received: 0,
+                write_started: None,
             }),
             transmit: Notify::new(),
             closed: watch::Sender::new(None),
@@ -184,7 +188,51 @@ impl MuxTransport {
         }
         tokio::spawn(read_loop(read, shared.clone()));
         tokio::spawn(write_loop(write, shared.clone()));
-        Self { shared }
+        Self {
+            shared,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            socket: None,
+        }
+    }
+
+    /// Keep a duplicate of the authenticated outer socket for on-demand TCP_INFO.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn with_socket(mut self, socket: Option<std::os::fd::OwnedFd>) -> Self {
+        self.socket = socket.map(Arc::new);
+        self
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn tcp_info(&self) -> Option<serde_json::Value> {
+        use linux_raw_sys::net::tcp_info;
+        use std::os::fd::AsRawFd;
+        let fd = self.socket.as_ref()?.as_raw_fd();
+        // SAFETY: Linux's tcp_info consists entirely of integer fields. Zeroing it also
+        // initializes the tail for kernels returning an older version of the structure.
+        let mut info: tcp_info = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+        // SAFETY: fd is owned throughout this call and len bounds the writable buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                (&raw mut info).cast(),
+                &raw mut len,
+            )
+        };
+        if rc != 0 || (len as usize) < std::mem::offset_of!(tcp_info, tcpi_total_retrans) + 4 {
+            return None;
+        }
+        Some(
+            serde_json::json!({"rtt_us":info.tcpi_rtt,"retransmits":info.tcpi_total_retrans,
+            "unacked":info.tcpi_unacked,"cwnd_segments":info.tcpi_snd_cwnd}),
+        )
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn tcp_info(&self) -> Option<serde_json::Value> {
+        None
     }
 
     fn stream(&self, id: u64) -> (SendHalf, RecvHalf) {
@@ -280,6 +328,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut write: W, shared: Arc<Shared>) {
             shared.transmit.notified().await;
             continue;
         }
+        if log::log_enabled!(target:"partizan_diag", log::Level::Info) {
+            shared.lock().write_started = Some(std::time::Instant::now());
+        }
         if let Err(e) = async {
             write.write_all(&out).await?;
             write.flush().await
@@ -289,7 +340,15 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut write: W, shared: Arc<Shared>) {
             shared.fail(TransportError::Lost(e.to_string()));
             return;
         }
-        shared.lock().bytes_sent += out.len() as u64;
+        {
+            let mut st = shared.lock();
+            if let Some(started) = st.write_started.take()
+                && started.elapsed() >= std::time::Duration::from_millis(100)
+            {
+                log::info!(target:"partizan_diag","tls_write_wait_ms={}",started.elapsed().as_millis());
+            }
+            st.bytes_sent += out.len() as u64;
+        }
         out.clear();
     }
 }
@@ -361,6 +420,11 @@ impl Transport for MuxTransport {
         Some(MAX_DATAGRAM)
     }
 
+    fn diagnostics(&self) -> serde_json::Value {
+        let st = self.shared.lock();
+        serde_json::json!({"blocked_writers":st.writers.len(),"queued_datagrams":st.datagrams.len(),
+            "pending_streams":st.incoming.len(),"write_pending_ms":st.write_started.map(|t|t.elapsed().as_millis() as u64),"tcp_info":self.tcp_info()})
+    }
     fn stats(&self) -> TransportStats {
         let st = self.shared.lock();
         TransportStats {

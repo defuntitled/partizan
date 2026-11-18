@@ -62,12 +62,17 @@ impl Engine {
         dst: TargetAddr,
         wait_result: bool,
     ) -> Result<(SendHalf, RecvHalf), ConnectError> {
+        let started = log::log_enabled!(target:"partizan_diag", log::Level::Debug)
+            .then(std::time::Instant::now);
         let session = self.session().await?;
         let (mut send, mut recv) = session
             .transport
             .open_stream()
             .await
             .map_err(|_| ConnectError::Closed)?;
+        if let Some(started) = started {
+            log::debug!(target:"partizan_diag","stream_open_us={}",started.elapsed().as_micros());
+        }
         let mut header = Vec::with_capacity(32);
         Connect {
             addr: dst,
@@ -90,7 +95,10 @@ impl Engine {
         let dst = request.dst.clone();
         match self.open_tcp(request.dst, false).await {
             Ok((send, recv)) => self.relay(request.io, send, recv, true).await,
-            Err(e) => log::debug!("connect to {dst:?} failed: {e}"),
+            Err(e) => {
+                log::info!(target:"partizan_diag","stream_open_failed code={}",e.socks_reply());
+                log::debug!("connect to {dst:?} failed: {e}");
+            }
         }
     }
 }

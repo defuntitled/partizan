@@ -49,7 +49,9 @@ impl IpNet {
     /// Whether `ip` is in this network; never across families.
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => u32::from(ip) & mask32(self.prefix) == net.into(),
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                u32::from(ip) & mask32(self.prefix) == u32::from(net)
+            }
             (IpAddr::V6(net), IpAddr::V6(ip)) => {
                 u128::from(ip) & mask128(self.prefix) == net.into()
             }

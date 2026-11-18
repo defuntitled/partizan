@@ -11,6 +11,7 @@ license.workspace = true
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
+serde_json.workspace = true
 client-core.workspace = true
 libc.workspace = true
 log.workspace = true

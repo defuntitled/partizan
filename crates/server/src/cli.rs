@@ -13,6 +13,7 @@ pub enum Action {
     Revoke { key: String },
     List,
     Sessions,
+    Diagnostics,
 }
 
 pub fn run(config_path: &Path, action: Action) -> Result<(), String> {
@@ -52,8 +53,13 @@ pub fn run(config_path: &Path, action: Action) -> Result<(), String> {
             }
             Ok(())
         }
-        Action::Sessions => {
-            let answer = request(&config, "sessions").ok_or("the server is not running")?;
+        Action::Sessions | Action::Diagnostics => {
+            let command = if matches!(action, Action::Sessions) {
+                "sessions"
+            } else {
+                "diagnostics"
+            };
+            let answer = request(&config, command).ok_or("the server is not running")?;
             print!("{answer}");
             Ok(())
         }

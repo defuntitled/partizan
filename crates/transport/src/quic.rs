@@ -189,6 +189,16 @@ impl Transport for QuicTransport {
         self.conn.max_datagram_size()
     }
 
+    fn diagnostics(&self) -> serde_json::Value {
+        let stats = self.conn.stats();
+        let p = stats.path;
+        serde_json::json!({"cwnd_bytes":p.cwnd,"lost_packets":p.lost_packets,
+            "sent_packets":p.sent_packets,"lost_bytes":p.lost_bytes,"congestion_events":p.congestion_events,
+            "data_blocked":stats.frame_tx.data_blocked,"stream_data_blocked":stats.frame_tx.stream_data_blocked,
+            "streams_blocked":stats.frame_tx.streams_blocked_bidi,"peer_stream_resets":stats.frame_rx.reset_stream,
+            "path_mtu":p.current_mtu,"mtu_probes_lost":p.lost_plpmtud_probes,
+            "mtu_probes_sent":p.sent_plpmtud_probes,"black_holes":p.black_holes_detected})
+    }
     fn stats(&self) -> TransportStats {
         let stats = self.conn.stats();
         TransportStats {
